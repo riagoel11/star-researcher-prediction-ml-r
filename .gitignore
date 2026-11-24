@@ -1,0 +1,8 @@
+# Data is not redistributed (provided by the module team)
+*.csv
+.Rhistory
+.RData
+.Rproj.user/
+*_cache/
+*_files/
+.DS_Store

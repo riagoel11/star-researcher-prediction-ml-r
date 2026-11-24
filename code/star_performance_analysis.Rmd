@@ -1,0 +1,2114 @@
+---
+title: "Predicting Star Performance in Collaboration Networks"
+author: "Ria Goel"
+date: "`r Sys.Date()`"
+output:
+  
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: false
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: '3'
+    number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+options(scipen = 999, digits = 4)
+set.seed(40481810)  
+
+```
+
+```{r libraries, message=FALSE}
+# ── Load packages ──
+
+library(MASS)
+library(car)
+library(glmnet)
+library(caret)
+library(boot)
+library(tidyverse)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(pROC)
+library(patchwork)
+library(scales)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+
+# Explicitly pin dplyr::select so MASS doesn't shadow it
+select <- dplyr::select
+```
+
+# Introduction
+
+Academic collaboration networks are inherently unequal, with a small proportion of researchers generating a disproportionately large share of scientific output. This pattern reflects Merton’s (1968) *Matthew effect*, where early advantages accumulate over time and translate into sustained success. Understanding what drives the emergence of such “star” performers is a central question in the sociology of science, with important implications for how individuals and institutions approach collaboration and career development.
+
+This study is informed by three complementary theoretical frameworks. Liu et al. (2018) argue that collaboration with elite performers enables the transfer of tacit, high-impact skills, particularly when these relationships are structurally cohesive. In contrast, Burt (2004) emphasises the advantage of spanning structural holes, where individuals act as brokers between disconnected groups and gain access to diverse, non-redundant information. Adding further nuance, Uzzi (1997) suggests that while cohesive networks promote trust and effective collaboration, they may also limit exposure to novel ideas, highlighting the importance of network balance. Complementing these perspectives, Fleming (2001) demonstrates that “T-shaped” individuals ( those combining deep expertise with broad interdisciplinary knowledge ) are more likely to generate innovative outcomes.
+
+The analysis uses a dataset of 143,766 researchers, capturing collaboration patterns, network structure, and expertise breadth. The report is structured as follows: exploratory data analysis, regression modelling, LASSO-based feature selection, classification using logistic regression and LDA, and finally interaction analysis to evaluate theoretical predictions.
+
+# Methodology 
+
+The analytical pipeline translates the theoretical frameworks into a structured empirical strategy, moving from exploration to prediction and classification. Missing values were handled selectively rather than through blanket imputation. Variables capturing the absence of elite collaboration (Cohesion_Elite, Expertise_Sim_Elite, Repeated_Elite) were set to zero, as this reflects true structural absence rather than missing data. All remaining missing values were addressed through listwise deletion during model estimation to preserve the underlying distributions. The full dataset of 143,766 observations was retained, as subsetting would risk removing rare high-performing cases that are essential for classification analysis.
+
+The response variable, Total_Impact, exhibited strong right skew, requiring a log transformation (log(Total_Impact + 1)) to stabilise variance and satisfy linear regression assumptions. For classification, a stratified 70/30 train-test split was applied to ensure proportional representation of high performers. All models were estimated using a fixed random seed (40481810), ensuring full reproducibility across the analysis.A threshold of 0.2 was selected to prioritise recall due to class imbalance in logistic regression.
+
+```{r load-data}
+# ============================================================
+# CONFIGURATION — set path to your dataset
+# ============================================================
+DATA_PATH <- "St_An_C27Fe_S01_th85_C2016.csv"
+
+df <- read_csv(DATA_PATH, show_col_types = FALSE)
+
+# Create log-transformed response (required for all regression models)
+df <- df %>% mutate(Log_Impact = log(Total_Impact + 1))
+
+cat("Dataset:", nrow(df), "observations,", ncol(df), "columns\n")
+cat("High performers:", sum(df$Is_HighPerformer),
+    sprintf("(%.1f%%)\n", 100 * mean(df$Is_HighPerformer)))
+```
+```{r handle-missing}
+# ── Handle missing values ──
+
+
+# 1. Missing values before handling 
+na_summary <- colSums(is.na(df)) %>% 
+  enframe(name = "Variable", value = "Missing_Before")
+
+# 2. Zero-filling the elite variables 
+elite_fill_vars <- c("Cohesion_Elite", "Expertise_Sim_Elite", "Repeated_Elite")
+df <- df %>%
+  mutate(across(all_of(all_of(elite_fill_vars)), ~ replace_na(.x, 0)))
+
+# 3. Final missing values after handling 
+summary_tbl <- na_summary %>%
+  left_join(
+    colSums(is.na(df)) %>% enframe(name = "Variable", value = "Missing_After"),
+    by = "Variable"
+  ) %>%
+  filter(Missing_Before > 0)
+
+# 4. Final table
+summary_tbl %>%
+  kable(caption = "NA Audit: Structural Zero-Fill Comparison",
+        col.names = c("Variable", "NAs Before", "NAs After")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE) %>%
+  column_spec(3, 
+              bold = TRUE, 
+              color = ifelse(summary_tbl$Missing_After > 0, "red", "darkgreen"))
+```
+# Part 1: Exploratory Data Analysis
+
+The dataset contains 143,766 researchers, of whom 16,538 (11.5%) are classified as high performers — a moderately imbalanced target with direct consequences for classification evaluation in Part 4. `Total_Impact` is severely right-skewed (skewness = 284.2), with a mean of 304 citations but a median of just 27, confirming the superstar phenomenon where a tiny elite generates the majority of collective output. Log-transformation reduces skewness to 0.35, making the outcome suitable for regression. The correlation matrix (Figure 1) reveals two critical multicollinearity problems: `Cohesion_Regular` and `Network_Efficiency` are near-perfectly negatively correlated (r = –0.996) and cannot enter any model simultaneously, while `Num_Elite_Collaborators` and `Projects_With_Elite` co-move at r = 0.881 because more elite contacts mechanically produces more elite projects. These overlaps directly motivate LASSO regularisation in Part 3.
+
+## Q1: Summary Statistics
+
+```{r q1-summary}
+# Variables selected to span all three theoretical frameworks:
+#   Liu: Num_Elite_Collaborators, Cohesion_Elite, Repeated_Elite, Projects_With_Elite
+#   Burt: Network_Constraint, Effective_Size
+#   Fleming: Num_Domains, Total_Projects, Career_Length
+# Plus outcomes: Total_Impact, Log_Impact
+
+key_vars <- c(
+  "Total_Impact", "Log_Impact",
+  "Total_Projects", "Career_Length",
+  "Num_Topics", "Num_Domains",
+  "Num_Collaborators", "Num_Elite_Collaborators",
+  "Cohesion_Elite", "Expertise_Sim_Elite",
+  "Repeated_Elite", "Projects_With_Elite",
+  "Num_Regular_Collaborators", "Cohesion_Regular",
+  "Network_Constraint", "Effective_Size", "Network_Efficiency"
+)
+
+summary_tbl <- df %>%
+  select(all_of(key_vars)) %>%
+  pivot_longer(everything(), names_to = "Variable") %>%
+  group_by(Variable) %>%
+  summarise(
+    N       = sum(!is.na(value)),
+    Mean    = mean(value, na.rm = TRUE),
+    SD      = sd(value, na.rm = TRUE),
+    Min     = min(value, na.rm = TRUE),
+    Q1      = quantile(value, 0.25, na.rm = TRUE),
+    Median  = median(value, na.rm = TRUE),
+    Q3      = quantile(value, 0.75, na.rm = TRUE),
+    Max     = max(value, na.rm = TRUE),
+    Missing = sum(is.na(value))
+  ) %>%
+  # Reorder to match the key_vars sequence above
+  mutate(Variable = factor(Variable, levels = key_vars)) %>%
+  arrange(Variable)
+
+summary_tbl %>%
+  kable(digits = 3,
+        caption = "Q1: Summary Statistics for Key Variables") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 12) %>%
+  pack_rows("Outcome Variables", 1, 2) %>%
+  pack_rows("Experience & Breadth (Fleming 2001)", 3, 6) %>%
+  pack_rows("Elite Network Variables (Liu et al. 2018)", 7, 12) %>%
+  pack_rows("Regular Network & Structural Holes (Burt 2004)", 13, 17)
+```
+
+
+## Q2: Correlation Matrix
+
+```{r q2-correlation, fig.width=13, fig.height=11}
+# Exclude AID (identifier), binary outcome, and log-outcome to focus
+# on correlations among the raw predictors
+numeric_cols <- df %>%
+  select(-AID, -Is_HighPerformer, -Log_Impact) %>%
+  select(where(is.numeric))
+
+cor_matrix <- cor(numeric_cols, use = "pairwise.complete.obs")
+
+# Custom colour palette: diverging blue-white-red centred at 0
+col_palette <- colorRampPalette(c("#2166AC", "#F7F7F7", "#D6604D"))(200)
+
+corrplot(
+  cor_matrix,
+  method    = "color",
+  type      = "lower",
+  col       = col_palette,
+  tl.cex    = 0.72,
+  tl.col    = "black",
+  addCoef.col = "black",
+  number.cex  = 0.48,
+  diag      = FALSE,
+  title     = "FIGURE-1 Q2: Pearson Correlation Matrix (pairwise complete observations)",
+  mar       = c(0, 0, 2, 0)
+)
+```
+
+```{r q2-high-corr-table}
+# Flag pairs with |r| > 0.7 — potential multicollinearity concerns
+high_corr <- which(abs(cor_matrix) > 0.7 & upper.tri(cor_matrix), arr.ind = TRUE)
+
+if (nrow(high_corr) > 0) {
+  high_pairs <- data.frame(
+    Variable_1 = rownames(cor_matrix)[high_corr[, 1]],
+    Variable_2 = colnames(cor_matrix)[high_corr[, 2]],
+    Pearson_r  = cor_matrix[high_corr]
+  ) %>%
+    arrange(desc(abs(Pearson_r)))
+
+  high_pairs %>%
+    kable(digits = 3,
+          caption = "High Correlation Pairs (|r| > 0.7) — Potential Multicollinearity") %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+} else {
+  cat("No pairs exceed |r| = 0.7.\n")
+}
+```
+
+Taken together, Figures 2–7( fig. 5 in A1) identify a clear set of strongest predictors of star performance. Career length is important, with stars having much longer careers (median 19 vs 1), indicating the role of accumulated experience. However, elite exposure emerges as the most powerful predictor: the number of elite collaborators shows a steep gradient, with the probability of being a star rising from 0.1% (no elite ties) to 83.1% (>10 ties), strongly supporting elite collaboration theory (Liu et al., 2018).
+Network structure also plays a key role. Lower Network Constraint among stars aligns with brokerage advantages (Burt, 2004), while greater knowledge breadth (topics) supports innovation theory (Fleming, 2001). The mirror effect further shows that spanning diverse elite clusters, rather than being embedded, is predictive. Overall, elite exposure dominates, with brokerage and breadth acting as complementary enhancers.
+
+
+
+## Q3: Scatter Plots — Log_Impact vs Key Predictors
+
+```{r q3-scatter, fig.width=16, fig.height=5}
+# Three scatter plots requested by the assignment:
+#   (a) Log_Impact vs Num_Elite_Collaborators
+#   (b) Log_Impact vs Cohesion_Elite
+#   (c) Log_Impact vs Effective_Size
+
+scatter_df <- df %>%
+  transmute(
+    Log_Impact,
+    `log(Num_Elite + 1)`   = log1p(Num_Elite_Collaborators),
+    `Cohesion_Elite`        = Cohesion_Elite,
+    `log(Effective_Size+1)` = log1p(Effective_Size)
+  ) %>%
+  pivot_longer(-Log_Impact, names_to = "Predictor", values_to = "Value") %>%
+  drop_na()
+
+# Down-sample for plotting speed (120k+ points → overplotting)
+set.seed(40481810)
+scatter_sample <- scatter_df %>%
+  group_by(Predictor) %>%
+  slice_sample(n = 50000, replace = FALSE) %>%
+  ungroup()
+
+ggplot(scatter_sample, aes(x = Value, y = Log_Impact)) +
+  geom_point(alpha = 0.15, size = 0.6, colour = "#4292C6") +
+  geom_rug(sides = "b", alpha = 0.03, colour = "#4292C6") +
+  geom_smooth(method = "gam", span = 0.4,
+              colour = "#D6604D", linewidth = 1.1,
+              se = TRUE, fill = "#D6604D", alpha = 0.18) +
+  facet_wrap(~ Predictor, scales = "free_x", nrow = 1) +
+  labs(
+    title    = "FIGURE-2 Q3: Scatter plots of Log_Impact against three key predictors",
+    subtitle = "Heavy-tailed predictors shown on log1p scale to spread the dense low-value region;\nred line = LOESS smoother with 95% CI; rug marks show data density on x-axis",
+    x = "Predictor value", y = "log(Total_Impact + 1)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text     = element_text(face = "bold"),
+    plot.title     = element_text(face = "bold"),
+    plot.subtitle  = element_text(colour = "grey50", size = 10)
+  )
+```
+
+## Q4: Boxplots by Star Status
+
+```{r q4-boxplots, fig.width=16, fig.height=9}
+# Variables to compare across Is_HighPerformer groups
+# We log1p-transform right-skewed count variables to make
+# distributional differences visible inside the boxes.
+
+box_vars_log   <- c("Total_Impact", "Total_Projects", "Career_Length",
+                    "Num_Elite_Collaborators", "Effective_Size", "Repeated_Elite")
+box_vars_raw   <- c("Cohesion_Elite", "Network_Constraint",
+                    "Cohesion_Regular", "Network_Efficiency")
+
+all_box_vars   <- c(box_vars_log, box_vars_raw)
+
+box_df <- df %>%
+  mutate(Status = factor(Is_HighPerformer,
+                         levels = c(0, 1),
+                         labels = c("Non-Star", "Star"))) %>%
+  select(Status, all_of(all_box_vars)) %>%
+  # Log-transform only the count/skewed variables
+  mutate(across(all_of(box_vars_log), ~ log1p(.x))) %>%
+  pivot_longer(-Status, names_to = "Variable", values_to = "Value") %>%
+  # Label each panel clearly
+  mutate(Variable = recode(Variable,
+    Total_Impact             = "log(Total_Impact+1)",
+    Total_Projects           = "log(Total_Projects+1)",
+    Career_Length            = "log(Career_Length+1)",
+    Num_Elite_Collaborators  = "log(Num_Elite+1)",
+    Effective_Size           = "log(Effective_Size+1)",
+    Repeated_Elite           = "log(Repeated_Elite+1)"
+  ))
+
+ggplot(box_df, aes(x = Status, y = Value, fill = Status)) +
+  geom_boxplot(alpha = 0.65, outlier.alpha = 0.08, outlier.size = 0.5) +
+  # Diamond marks show the group mean (complement to the median line)
+  stat_summary(fun = mean, geom = "point",
+               shape = 18, size = 3, colour = "black") +
+  scale_fill_manual(values = c("Non-Star" = "#457B9D", "Star" = "#E63946")) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 5) +
+  labs(
+    title    = "FIGURE-3 Q4: Variable distributions by star status",
+    subtitle = "Count variables shown on log1p scale; diamond = group mean; box = IQR; whiskers = 1.5×IQR",
+    x = NULL, y = "Value"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "top",
+    strip.text      = element_text(face = "bold", size = 9),
+    plot.title      = element_text(face = "bold"),
+    plot.subtitle   = element_text(colour = "grey50", size = 10),
+    axis.text.x     = element_text(size = 9)
+  )
+```
+
+## Q5: Hypothesised Strongest Predictors
+
+```{r q5-strongest}
+# Point-biserial correlation: natural measure of association between a
+# continuous predictor and a binary outcome.
+
+predictors <- df %>%
+  select(-AID, -Is_HighPerformer, -Total_Impact, -Log_Impact) %>%
+  select(where(is.numeric)) %>%
+  names()
+
+pb_results <- map_dfr(predictors, function(v) {
+  sub <- df %>% select(Is_HighPerformer, all_of(v)) %>% drop_na()
+  if (sd(sub[[v]], na.rm = TRUE) == 0) return(NULL)  # skip zero-variance
+  r <- cor(sub[[v]], sub$Is_HighPerformer, use = "complete.obs")
+  tibble(Variable = v, r_pb = r, abs_r = abs(r))
+}) %>%
+  arrange(desc(abs_r))
+
+pb_results %>%
+  mutate(
+    Direction = if_else(r_pb > 0, "↑ with stars", "↓ with stars"),
+    Theory    = case_when(
+      Variable %in% c("Num_Elite_Collaborators", "Cohesion_Elite",
+                      "Expertise_Sim_Elite", "Repeated_Elite",
+                      "Projects_With_Elite") ~ "Liu et al. 2018",
+      Variable %in% c("Network_Constraint", "Effective_Size",
+                      "Network_Efficiency")     ~ "Burt 2004",
+      Variable %in% c("Num_Domains", "Num_Topics",
+                      "Total_Projects")          ~ "Fleming 2001",
+      TRUE                                       ~ "General"
+    )
+  ) %>%
+  kable(digits = 3,
+        col.names = c("Variable", "Point-biserial r", "Absolute r", "Direction", "Theory"),
+        caption   = "Q5: Point-biserial correlations with Is_HighPerformer (ranked by |r|)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(which(abs(pb_results$abs_r) >= 0.4), bold = TRUE, background = "#FFF3CD")
+```
+
+```{r q5-bar-chart, fig.width=10, fig.height=6}
+# Visualise the ranking as a horizontal bar chart coloured by theory
+pb_results %>%
+  mutate(
+    Theory = case_when(
+      Variable %in% c("Num_Elite_Collaborators", "Cohesion_Elite",
+                      "Expertise_Sim_Elite", "Repeated_Elite",
+                      "Projects_With_Elite") ~ "Liu et al. 2018",
+      Variable %in% c("Network_Constraint", "Effective_Size",
+                      "Network_Efficiency")     ~ "Burt 2004",
+      Variable %in% c("Num_Domains", "Num_Topics",
+                      "Total_Projects")          ~ "Fleming 2001",
+      TRUE                                       ~ "General"
+    ),
+    Variable = fct_reorder(Variable, abs_r)
+  ) %>%
+  ggplot(aes(x = r_pb, y = Variable, fill = Theory)) +
+  geom_col(alpha = 0.85) +
+  geom_vline(xintercept = 0, colour = "grey30", linewidth = 0.8) +
+  scale_fill_manual(values = c(
+    "Liu et al. 2018" = "#E63946",
+    "Burt 2004"       = "#457B9D",
+    "Fleming 2001"    = "#2A9D8F",
+    "General"         = "#8E8E93"
+  )) +
+  labs(
+    title    = "FIGURE-4 Q5: Point-biserial correlations with Is_HighPerformer",
+    subtitle = "Bars coloured by theoretical framework; positive = more associated with stars",
+    x = "Point-biserial correlation (r)", y = NULL, fill = "Framework"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title     = element_text(face = "bold"),
+    plot.subtitle  = element_text(colour = "grey50", size = 10),
+    legend.position = "bottom"
+  )
+```
+
+## Mirror Effect Plot 
+
+```{r Mirror effect density plot }
+df %>%
+  select(Is_HighPerformer, Cohesion_Elite, Cohesion_Regular) %>%
+  pivot_longer(cols = c(Cohesion_Elite, Cohesion_Regular),
+               names_to = "Type", values_to = "Cohesion") %>%
+  mutate(Status = factor(Is_HighPerformer, labels = c("Non-Star", "Star"))) %>%
+  ggplot(aes(x = Status, y = Cohesion, fill = Type)) +
+  geom_boxplot(alpha = 0.7 , na.rm = TRUE ) +
+  scale_fill_manual(values = c("Cohesion_Elite" = "#D6604D", "Cohesion_Regular" = "#4393C3")) +
+  labs(
+    title = "Figure 6: The Mirror Effect in Collaborative Cohesion",
+    subtitle = "Comparing Elite vs. Regular network density across performance tiers",
+    x = "Performance Status", 
+    y = "Cohesion Score (Density)",
+    fill = "Network Type"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## Marginal Effect 
+
+```{r elite-career-marginal, fig.width=11, fig.height=7}
+# Fit an interaction model: log(elite+1) * Career_Length
+# with a quadratic elite term to capture diminishing returns
+comp_df <- df %>%
+  select(Is_HighPerformer, Num_Elite_Collaborators, Career_Length) %>%
+  drop_na() %>%
+  mutate(Log_Elite = log1p(Num_Elite_Collaborators))
+
+comp_model <- glm(
+  Is_HighPerformer ~ Log_Elite + I(Log_Elite^2) + Career_Length + Log_Elite:Career_Length,
+  data   = comp_df,
+  family = binomial
+)
+
+# Three career stages: 10th, 50th, 90th percentile of Career_Length
+career_levels <- quantile(comp_df$Career_Length,
+                          c(0.10, 0.50, 0.90), na.rm = TRUE)
+
+career_labels <- c(
+  sprintf("Early career (%.0f yrs)", career_levels[1]),
+  sprintf("Mid career (%.0f yrs)",   career_levels[2]),
+  sprintf("Late career (%.0f yrs)",  career_levels[3])
+)
+
+# Elite range from 0 to 95th percentile
+elite_grid <- seq(0,
+                  quantile(comp_df$Num_Elite_Collaborators, 0.95, na.rm = TRUE),
+                  length.out = 300)
+
+curve_df <- purrr::map2_dfr(
+  as.list(career_levels),
+  career_labels,
+  function(cl, lbl) {
+    tibble(
+      Log_Elite     = log1p(elite_grid),
+      Career_Length = cl,
+      Num_Elite     = elite_grid,
+      P_Star        = predict(comp_model,
+                              newdata = tibble(Log_Elite     = log1p(elite_grid),
+                                               Career_Length = cl),
+                              type    = "response"),
+      Career_Stage  = lbl
+    )
+  }
+) %>%
+  mutate(Career_Stage = factor(Career_Stage, levels = career_labels))
+
+# Mark where the slope flattens (2nd, 5th, 10th elite collaborator)
+milestones <- tibble(x = c(1, 4, 9), label = c("1st", "5th", "10th"))
+
+ggplot(curve_df, aes(x = Num_Elite, y = P_Star,
+                     colour = Career_Stage,
+                     linetype = Career_Stage)) +
+  geom_line(linewidth = 1.5) +
+  # Vertical reference lines at first few elite contacts
+  geom_vline(xintercept = c(1, 5, 10),
+             linetype = "dotted", colour = "grey60", linewidth = 0.7) +
+  annotate("text", x = c(1, 5, 10),
+           y = max(curve_df$P_Star, na.rm = TRUE) * 1.02,
+           label = c("1st", "5th", "10th"),
+           size = 3.2, colour = "grey40", hjust = -0.1) +
+  geom_hline(yintercept = mean(comp_df$Is_HighPerformer),
+             linetype = "dashed", colour = "grey45", linewidth = 0.8) +
+  annotate("text", x = max(elite_grid) * 0.7,
+           y = mean(comp_df$Is_HighPerformer) + 0.004,
+           label = "Population average", colour = "grey45", size = 3) +
+  scale_colour_manual(values = c("#2A9D8F", "#F4A261", "#E63946")) +
+  scale_linetype_manual(values = c("dotted", "dashed", "solid")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Figure 7: Do the first elite collaborators matter most — and for whom?",
+    subtitle = "Predicted P(Star) as elite contacts increase, by career stage\n(other predictors held at median; dotted verticals = 1st, 5th, 10th elite contact)",
+    x        = "Number of Elite Collaborators",
+    y        = "Predicted P(High Performer)",
+    colour   = "Career Stage",
+    linetype = "Career Stage"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    plot.subtitle   = element_text(colour = "grey50", size = 10),
+    legend.position = "bottom"
+  )
+```
+
+# Part 2: Linear Regression Analysis 
+
+This section predicts `Log_Impact` (continuous) using three regression approaches: simple linear regression , multiple linear regression , and polynomial regression (testing diminishing returns). The goal is to identify *which* variables drive research impact and *how much* each one contributes after controlling for the others.
+
+## Q6–Q8: Simple Linear Regression
+
+The simple regression of `Log_Impact` on `Num_Elite_Collaborators` (Figure 8) establishes the baseline. The coefficient of 0.011 is highly significant (p < 2e-16), indicating a consistent positive association between elite collaboration and impact. However, an R² of 0.106 tells us elite exposure alone explains only about 11% of the variance, reflecting the multiple factors influencing citations. The LOESS smoother (Figure 8) closely tracks the OLS line, supporting a linear approximation, though slight divergence at higher values suggests diminishing returns.Diagnostic plots indicate OLS assumptions are only partially satisfied: residuals are centred, but heteroscedasticity, minor non-normality, and influential points are present. While OLS provides a useful baseline, these violations justify the use of multiple regression and LASSO for more robust inference.
+
+```{r q6-slr}
+# ── Q6: Fit simple linear regression ──
+# We use Num_Elite_Collaborators as the single predictor because it is
+# the theoretically central variable (Liu et al. 2018) and has the
+# second-strongest point-biserial correlation with star status (r = 0.40).
+# drop_na() ensures we only use complete cases for this pair.
+
+valid_slr <- df %>% select(Log_Impact, Num_Elite_Collaborators) %>% drop_na()
+model_simple <- lm(Log_Impact ~ Num_Elite_Collaborators, data = valid_slr)
+
+# ── Q7: Present results in a clean table ──
+slr_summary <- summary(model_simple)
+
+# Extract key statistics into a readable table
+slr_stats <- tibble(
+  Statistic = c("Intercept", "Coefficient (Num_Elite_Collaborators)",
+                "R²", "Adjusted R²", "F-statistic", "p-value", "N"),
+  Value = c(
+    sprintf("%.4f", coef(model_simple)[1]),
+    sprintf("%.6f", coef(model_simple)[2]),
+    sprintf("%.4f", slr_summary$r.squared),
+    sprintf("%.4f", slr_summary$adj.r.squared),
+    sprintf("%.1f", slr_summary$fstatistic[1]),
+    "< 2e-16 ***",
+    format(nrow(valid_slr), big.mark = ",")
+  )
+)
+
+slr_stats %>%
+  kable(caption = "Q6–Q7: Simple Linear Regression — Log_Impact ~ Num_Elite_Collaborators") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+```{r q8-residuals, fig.width=17, fig.height=10}
+# ── Q8: Residual diagnostic plots ──
+# Four standard diagnostic plots arranged in a 2×2 grid.
+# We look for:
+#   (a) Residuals vs Fitted: random scatter around zero — no pattern
+#   (b) Normal Q-Q: points following the diagonal — normality of residuals
+#   (c) Scale-Location: flat band — homoscedasticity
+#   (d) Residuals vs Leverage: no highly influential points
+
+# Increase top outer margin (oma) to give headings room
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 2), oma = c(0, 0, 2, 0))
+
+# Reduce the title size using cex.main
+plot(model_simple, which = 1,
+     col = "#457B9D", pch = 16, cex = 0.3, cex.main = 0.9) 
+
+plot(model_simple, which = 2,
+     col = "#457B9D", pch = 16, cex = 0.4, cex.main = 0.9)
+
+plot(model_simple, which = 3,
+     col = "#457B9D", pch = 16, cex = 0.4, cex.main = 0.9)
+
+plot(model_simple, which = 5,
+     col = "#457B9D", pch = 16, cex = 0.4, cex.main = 0.9)
+
+par(mfrow = c(1, 1))
+```
+
+```{r q8-slr-scatter, fig.width=10, fig.height=6}
+#  Scatter plot with regression line 
+# Down-sample for readability — 143k points overplot completely
+set.seed(40481810)
+slr_sample <- valid_slr %>% 
+  filter(Num_Elite_Collaborators < quantile(Num_Elite_Collaborators, 0.99)) %>%
+  slice_sample(n = 15000)
+
+ggplot(slr_sample, aes(x = log1p(Num_Elite_Collaborators), y = Log_Impact)) +
+  geom_point(alpha = 0.18, size = 0.7, colour = "#457B9D") +
+  geom_smooth(method = "lm",  colour = "#E63946",  linewidth = 1.2,
+              se = TRUE, fill = "#E63946", alpha = 0.15,
+              aes(x = log1p(Num_Elite_Collaborators), y = Log_Impact)) +
+  geom_smooth(method = "loess", colour = "grey30", linewidth = 1,
+              linetype = "dashed", se = FALSE,
+              aes(x = log1p(Num_Elite_Collaborators), y = Log_Impact)) +
+  labs(
+    title    = "FIGURE-8: Simple linear regression — Log_Impact vs log(Num_Elite + 1)",
+    subtitle = "Red = OLS regression line with 95% CI; dashed grey = LOESS smoother;\nlog1p scale applied to x-axis to handle zero-inflation",
+    x = "log(Num_Elite_Collaborators + 1)",
+    y = "log(Total_Impact + 1)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey50", size = 10))
+```
+*The LOESS smoother (dashed) closely tracks the OLS line, suggesting the linear approximation is reasonable on the log scale. Minor divergence at high elite counts hints at diminishing returns, motivating Q11.*
+
+
+## Q9–Q10: Multiple Linear Regression
+
+Including all theoretically motivated predictors controls for confounding and identifies *independent* effects on log-impact. The model incorporates variables from Liu (elite networks), Burt (structural position), Fleming (knowledge breadth), and experience, increasing R² to 0.650. The Standardised coefficients show `Num_Topics` (β* = 0.40) and `Num_Elite_Collaborators` (β* = 0.30) as the strongest positive predictors. In contrast, `Effective_Size` (β* = –0.51) and `Network_Constraint` (β* = –0.22) have strong negative effects, though this reflects multicollinearity between structural variables, as confirmed by VIF diagnostics. `Expertise_Sim_Elite` (β* = –0.22) is also negative, indicating that similarity with elite collaborators reduces impact, supporting Liu et al.’s (2018) argument that diversity within elite ties drives innovation.
+
+
+```{r q9-mlr}
+# ── Q9: Multiple linear regression ──
+# Predictor set chosen to represent all three theories without
+# including variables that are near-perfect linear combinations
+# of each other (e.g. Network_Efficiency ≈ 1 - Cohesion_Regular).
+# Career_Length and Total_Projects added as experience controls.
+
+mlr_predictors <- c(
+  "Total_Projects",          # Fleming — depth
+  "Career_Length",           # General — experience / Matthew effect
+  "Num_Elite_Collaborators", # Liu — volume of elite contact
+  "Cohesion_Elite",          # Liu — diversity of elite network
+  "Expertise_Sim_Elite",     # Liu — knowledge overlap with stars
+  "Effective_Size",          # Burt — non-redundant network reach
+  "Network_Constraint",      # Burt — structural hole position
+  "Num_Topics"               # Fleming — topic breadth
+)
+
+valid_mlr <- df %>%
+  select(Log_Impact, all_of(mlr_predictors)) %>%
+  drop_na()
+
+model_mlr <- lm(Log_Impact ~ ., data = valid_mlr)
+
+# Present as a formatted coefficient table
+mlr_summary <- summary(model_mlr)
+mlr_coef_df <- as.data.frame(mlr_summary$coefficients) %>%
+  rownames_to_column("Variable") %>%
+  rename(Estimate = Estimate, SE = `Std. Error`,
+         t_value = `t value`, p_value = `Pr(>|t|)`) %>%
+  filter(Variable != "(Intercept)") %>%
+  mutate(
+    Significance = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      p_value < 0.1   ~ ".",
+      TRUE            ~ ""
+    ),
+    Direction = ifelse(Estimate > 0, "↑ positive", "↓ negative"),
+    Theory = case_when(
+      Variable %in% c("Num_Elite_Collaborators",
+                      "Cohesion_Elite", "Expertise_Sim_Elite") ~ "Liu et al.",
+      Variable %in% c("Effective_Size",
+                      "Network_Constraint")                    ~ "Burt",
+      Variable %in% c("Num_Topics",
+                      "Total_Projects")                        ~ "Fleming",
+      TRUE                                                     ~ "General"
+    )
+  ) %>%
+  arrange(desc(abs(Estimate)))
+
+mlr_coef_df %>%
+  select(Variable, Theory, Estimate, SE, t_value, p_value, Significance, Direction) %>%
+  kable(digits = 4,
+        caption = sprintf("Q9: Multiple Linear Regression — Log_Impact ~ 8 predictors | R² = %.4f | Adj. R² = %.4f | N = %s",
+                          mlr_summary$r.squared,
+                          mlr_summary$adj.r.squared,
+                          format(nrow(valid_mlr), big.mark = ","))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  column_spec(3, bold = TRUE) %>%
+  row_spec(which(mlr_coef_df$p_value < 0.001), background = "#F0FFF0")
+```
+
+```{r q10-vif, fig.width=10, fig.height=5}
+# ── Q10: Variance Inflation Factors ──
+# VIF measures how much the variance of a coefficient is inflated
+# due to correlation with other predictors.
+# We expect some inflation between Burt variables (Effective_Size &
+# Network_Constraint are correlated r ≈ -0.85 from Q2).
+
+vif_values <- car::vif(model_mlr)
+vif_df <- tibble(
+  Variable = names(vif_values),
+  VIF      = vif_values
+) %>%
+  arrange(desc(VIF)) %>%
+  mutate(
+    Risk = case_when(
+      VIF >= 10 ~ "High (>10)",
+      VIF >= 5  ~ "Moderate (5-10)",
+      TRUE      ~ "Low (<5)"
+    ),
+    Variable = fct_reorder(Variable, VIF)
+  )
+
+ggplot(vif_df, aes(x = Variable, y = VIF, fill = Risk)) +
+  geom_col(alpha = 0.85) +
+  geom_hline(yintercept = 5,  linetype = "dashed",
+             colour = "orange", linewidth = 0.9) +
+  geom_hline(yintercept = 10, linetype = "dashed",
+             colour = "#E63946", linewidth = 0.9) +
+  annotate("text", x = 1.2, y = 5.4,  label = "VIF = 5 (concern)",
+           colour = "orange",  size = 3.5, hjust = 0) +
+  annotate("text", x = 1.2, y = 10.4, label = "VIF = 10 (serious)",
+           colour = "#E63946", size = 3.5, hjust = 0) +
+  scale_fill_manual(values = c("Low (<5)"       = "#2A9D8F",
+                                "Moderate (5-10)" = "orange",
+                                "High (>10)"      = "#E63946")) +
+  coord_flip() +
+  labs(title    = "FIGURE-9 Q10: Variance Inflation Factors — Multicollinearity Check",
+       subtitle = "All predictors should ideally be below 5; above 10 requires action",
+       x = NULL, y = "VIF", fill = "Risk level") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey50", size = 10),
+        legend.position = "bottom")
+
+# Print numerical VIF table
+vif_df %>%
+  select(Variable, VIF, Risk) %>%
+  kable(digits = 3, caption = "Q10: VIF Values") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+The MLR residuals are well-behaved for this type of data. The model is not misspecified in any serious way. The main issue is mild heteroscedasticity inherited from the citation distribution, not a fundamental modelling problem.
+ 
+
+## Q11: Polynomial Regression — Diminishing Returns to Career Length?
+
+The EDA scatter plot (Q3) and the career-stage density plot (Appendix A.1) both hinted that the relationship between `Career_Length` and `Log_Impact` may not be linear. The Matthew effect (Merton 1968) predicts *accelerating* returns early in career (reputations compound), while biological and institutional constraints may create *diminishing* returns at very long careers. We test this by adding a quadratic term `Career_Length²`.
+
+```{r q11-polynomial, fig.width=12, fig.height=5}
+# ── Q11: Polynomial regression ──
+# Compare Log_Impact ~ Career_Length  (linear)
+# vs      Log_Impact ~ Career_Length + Career_Length²  (quadratic)
+
+valid_poly <- df %>% select(Log_Impact, Career_Length) %>% drop_na()
+
+model_lin  <- lm(Log_Impact ~ Career_Length,                       data = valid_poly)
+model_poly <- lm(Log_Impact ~ Career_Length + I(Career_Length^2),  data = valid_poly)
+
+# ── Comparison table ──
+poly_compare <- tibble(
+  Model       = c("Linear", "Polynomial (+ Career²)"),
+  R_squared   = c(summary(model_lin)$r.squared,
+                  summary(model_poly)$r.squared),
+  Adj_R2      = c(summary(model_lin)$adj.r.squared,
+                  summary(model_poly)$adj.r.squared),
+  AIC         = c(AIC(model_lin), AIC(model_poly)),
+  BIC         = c(BIC(model_lin), BIC(model_poly))
+)
+
+poly_compare %>%
+  kable(digits = 4,
+        caption = "Q11: Linear vs Polynomial Regression Comparison") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+# ── p-value of quadratic term ──
+poly_coef <- summary(model_poly)$coefficients
+cat(sprintf("\nCareer_Length  coefficient: %.5f  (p = %.2e)\n",
+            poly_coef["Career_Length",    "Estimate"],
+            poly_coef["Career_Length",    "Pr(>|t|)"]))
+cat(sprintf("Career_Length² coefficient: %.6f  (p = %.2e)\n",
+            poly_coef["I(Career_Length^2)", "Estimate"],
+            poly_coef["I(Career_Length^2)", "Pr(>|t|)"]))
+
+# ── Visualisation ──
+x_range <- seq(min(valid_poly$Career_Length),
+               max(valid_poly$Career_Length),
+               length.out = 200)
+
+pred_df <- tibble(
+  Career_Length = x_range,
+  Linear        = predict(model_lin,  newdata = tibble(Career_Length = x_range)),
+  Polynomial    = predict(model_poly, newdata = tibble(Career_Length = x_range))
+) %>%
+  pivot_longer(-Career_Length, names_to = "Model", values_to = "Predicted")
+
+# Down-sample raw data for background scatter
+set.seed(40481810)
+poly_sample <- valid_poly %>% slice_sample(n = 15000)
+
+p_poly <- ggplot() +
+  geom_point(data = poly_sample,
+             aes(x = Career_Length, y = Log_Impact),
+             alpha = 0.15, size = 0.6, colour = "#457B9D") +
+  geom_line(data = pred_df,
+            aes(x = Career_Length, y = Predicted,
+                colour = Model, linewidth = Model)) +
+  scale_colour_manual(values = c("Linear" = "#2A9D8F",
+                                  "Polynomial" = "#E63946")) +
+  scale_linewidth_manual(values = c("Linear" = 0.9, "Polynomial" = 1.3)) +
+  labs(
+    title    = "FIGURE-10 : Linear vs Polynomial Regression — Career Length and Log_Impact",
+    subtitle = "Does experience have diminishing returns?\nRed = quadratic fit; green = linear fit; blue points = sampled data",
+    x = "Career Length (years)", y = "log(Total_Impact + 1)",
+    colour = "Model", linewidth = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title     = element_text(face = "bold"),
+        plot.subtitle  = element_text(colour = "grey50", size = 10),
+        legend.position = "top")
+
+print(p_poly)
+```
+
+The polynomial regression (Figure 10) confirms that Career_Length has diminishing returns, the quadratic term is negative (–0.0067) and R² improves from 0.433 to 0.452, a meaningful gain at this sample size. Impact rises steeply in early career years then flattens, consistent with Merton's (1968) Matthew effect that says early reputation gains compound quickly, but later career years add proportionally less.
+
+## Q12: Standardised Coefficients — Which Predictor Has the Strongest Effect?
+
+
+```{r q12-std-coefs, fig.width=11, fig.height=6}
+# ── Q12: Standardised coefficients ──
+# Larger absolute value = stronger practical effect.
+
+sd_y <- sd(valid_mlr$Log_Impact, na.rm = TRUE)
+
+std_coefs <- map_dfr(mlr_predictors, function(p) {
+  raw_coef  <- coef(model_mlr)[p]
+  sd_x      <- sd(valid_mlr[[p]], na.rm = TRUE)
+  std_coef  <- raw_coef * sd_x / sd_y
+  tibble(
+    Variable = p,
+    Raw_Coef = raw_coef,
+    Std_Coef = std_coef,
+    Theory   = case_when(
+      p %in% c("Num_Elite_Collaborators",
+               "Cohesion_Elite", "Expertise_Sim_Elite") ~ "Liu et al. 2018",
+      p %in% c("Effective_Size",
+               "Network_Constraint")                    ~ "Burt 2004",
+      p %in% c("Num_Topics",
+               "Total_Projects")                        ~ "Fleming 2001",
+      TRUE                                              ~ "General"
+    )
+  )
+}) %>%
+  arrange(Std_Coef)
+
+# ── Table ── (used claude ai to help generate a neat table )
+std_coefs %>%
+  mutate(Rank = rank(-abs(Std_Coef))) %>%
+  arrange(Rank) %>%
+  kable(digits = 4,
+        caption = "Q12: Standardised Coefficients (effect size comparison)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#FFF3CD")  # highlight strongest
+
+# ── Bar chart ──
+std_coefs %>%
+  mutate(Variable = fct_reorder(Variable, Std_Coef)) %>%
+  ggplot(aes(x = Variable, y = Std_Coef,
+             fill = Theory,
+             alpha = ifelse(abs(Std_Coef) == max(abs(Std_Coef)), 1, 0.75))) +
+  geom_col() +
+  geom_hline(yintercept = 0, linewidth = 0.8, colour = "grey30") +
+  scale_fill_manual(values = c(
+    "Liu et al. 2018" = "#E63946",
+    "Burt 2004"       = "#457B9D",
+    "Fleming 2001"    = "#2A9D8F",
+    "General"         = "#8E8E93"
+  )) +
+  scale_alpha_identity() +
+  coord_flip() +
+  labs(
+    title    = "FIGURE-11 Q12: Standardised MLR Coefficients — Effect Size Comparison",
+    subtitle = "Bars coloured by theoretical framework;\nlength = practical importance (SDs of Log_Impact per SD of predictor)",
+    x = NULL, y = "Standardised coefficient (β*)",
+    fill = "Framework"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title     = element_text(face = "bold"),
+        plot.subtitle  = element_text(colour = "grey50", size = 10),
+        legend.position = "bottom")
+```
+
+# Part 3: Feature Selection with LASSO 
+
+## Q13: LASSO with Cross-Validation
+
+```{r q13-lasso}
+# ── Q13: LASSO with 10-fold cross-validation ──
+
+all_predictors <- setdiff(names(df),
+                           c("AID", "Is_HighPerformer", "Total_Impact", "Log_Impact"))
+
+valid_lasso <- df %>%
+  select(Log_Impact, all_of(all_predictors)) %>%
+  drop_na()
+
+X_lasso <- as.matrix(valid_lasso[, all_predictors])
+y_lasso <- valid_lasso$Log_Impact
+
+# Standardise predictors — centres to mean 0, scales to SD 1
+# This ensures LASSO penalises all predictors equally regardless of units
+X_scaled <- scale(X_lasso)
+
+# Run LASSO with 10-fold CV
+# alpha = 1 means LASSO (alpha = 0 would be Ridge; 0 < alpha < 1 = Elastic Net)
+set.seed(40481810)
+lasso_cv      <- cv.glmnet(X_scaled, y_lasso, alpha = 1, nfolds = 10)
+optimal_lambda <- lasso_cv$lambda.min
+lambda_1se     <- lasso_cv$lambda.1se
+
+cat(sprintf("Optimal λ (lambda.min): %.6f\n", optimal_lambda))
+cat(sprintf("Conservative λ (lambda.1se): %.6f\n", lambda_1se))
+cat(sprintf("Min CV MSE: %.4f\n", min(lasso_cv$cvm)))
+
+# ── Plot the CV curve ──
+plot(lasso_cv)
+title(main = "FIGURE-12 : LASSO Cross-Validation — MSE vs log(λ)", line = 3)
+abline(v = log(optimal_lambda), col = "#E63946",  lty = 2, lwd = 1.5)
+abline(v = log(lambda_1se),     col = "#457B9D",  lty = 2, lwd = 1.5)
+legend("topright",
+       legend = c("lambda.min (lowest MSE)", "lambda.1se (parsimonious)"),
+       col    = c("#E63946", "#457B9D"),
+       lty    = 2, lwd = 1.5, cex = 0.85)
+
+# ── Extract and display coefficients at optimal lambda ──
+lasso_coefs <- coef(lasso_cv, s = "lambda.min")
+coef_df <- tibble(
+  Variable    = rownames(lasso_coefs)[-1],   # drop intercept row
+  Coefficient = as.numeric(lasso_coefs)[-1]
+) %>%
+  mutate(
+    Status = ifelse(Coefficient != 0, "Selected", "Dropped"),
+    Theory = case_when(
+      Variable %in% c("Num_Elite_Collaborators", "Cohesion_Elite",
+                      "Expertise_Sim_Elite", "Repeated_Elite",
+                      "Projects_With_Elite")               ~ "Liu et al. 2018",
+      Variable %in% c("Network_Constraint", "Effective_Size",
+                      "Network_Efficiency")                ~ "Burt 2004",
+      Variable %in% c("Num_Domains", "Num_Topics",
+                      "Total_Projects")                    ~ "Fleming 2001",
+      TRUE                                                 ~ "General"
+    )
+  ) %>%
+  arrange(desc(abs(Coefficient)))
+
+cat(sprintf("\nVariables selected by LASSO: %d out of %d\n",
+            sum(coef_df$Status == "Selected"),
+            nrow(coef_df)))
+
+coef_df %>%
+  kable(digits = 4,
+        caption = sprintf("Q13: LASSO Coefficients at λ = %.6f (standardised predictors)",
+                          optimal_lambda)) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+  row_spec(which(coef_df$Status == "Selected"),
+           background = "#F0FFF0") %>%
+  row_spec(which(coef_df$Status == "Dropped"),
+           color = "#AAAAAA")
+
+# Save selected variables for use in Parts 4-5
+selected <- coef_df %>% filter(Coefficient != 0) %>% pull(Variable)
+```
+## Q14: LASSO Coefficient Path Plot
+
+
+```{r q14 Coefficient path plot }
+
+
+lasso_full <-glmnet(X_scaled, y_lasso, alpha = 1)
+coef_matrix <- as.matrix(lasso_full$beta)
+path_df <- as.data.frame(t(coef_matrix)) %>%
+  mutate(log_lambda = log(lasso_full$lambda)) %>%
+  pivot_longer(-log_lambda, names_to = "Variable", values_to = "Coefficient")
+
+#Labelling the data where lambda is minimum
+label_data <- path_df %>%
+  filter(log_lambda == min(log_lambda)) %>%
+  # Only label variables that aren't zero to keep it clean
+  filter(abs(Coefficient) > 0.01) 
+
+# Create the ggplot
+ggplot(path_df, aes(x = log_lambda, y = Coefficient, group = Variable, color = Variable)) +
+  geom_line(alpha = 0.8) +
+  # Use ggrepel to label the lines at the start (left side)
+  geom_label_repel(data = label_data, 
+                   aes(label = Variable),
+                   nudge_x = -0.5, 
+                   direction = "y", 
+                   hjust = 1, 
+                   size = 3, 
+                   segment.alpha = 0.5,
+                   show.legend = FALSE) +
+  geom_vline(xintercept = log(optimal_lambda), linetype = "dashed", color = "#E63946", size = 1) +
+  geom_vline(xintercept = log(lambda_1se), linetype = "dashed", color = "#457B9D", size = 1) +
+  annotate("text", x = log(optimal_lambda), y = max(path_df$Coefficient), 
+           label = "lambda.min", color = "#E63946", angle = 90, vjust = -0.5, size = 3) +
+  labs(
+    title = "Figure 13: LASSO Coefficient Path",
+    subtitle = "Variable names labeled at their maximum magnitude; lines shrink to 0 as penalty increases",
+    x = "log(Lambda)",
+    y = "Standardised Coefficient"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none") 
+```
+At the optimal λ = 0.019317 ( lambda.min), 10-fold cross-validation selects 12 out of 17 predictors, dropping `Num_Collaborators`, `Effective_Size`, and `Network Efficiency` . The fact that lambda.min and lambda.1se are identical indicates that the CV error surface is flat at the minimum, suggesting the model is stable to small changes in the penalty. Figure 13 further explains this through the coefficient path. Multicollinearity is evident where variables such as `Num_Collaborators`, `Num_Domains`, and `Effective_Size` shrink rapidly toward zero, indicating overlapping information. In contrast, `Network_Efficiency` and `Cohesion_Regular` persist under stronger penalisation, showing robustness. These variables retain unique explanatory power and are therefore the most informative predictors.
+
+## Q15: Forward Selection Comparison
+
+
+```{r q15-forward, fig.width=11, fig.height=5}
+# ── Q15: Forward stepwise selection ──
+# Greedy algorithm: at each step, adds the variable that most improves R².
+# Comparing the two methods reveals which variables are robustly important.
+
+remaining        <- all_predictors
+selected_forward <- character(0)
+r2_growth        <- numeric(0)
+
+for (step in seq_len(min(12, length(all_predictors)))) {
+  best_r2  <- -Inf
+  best_var <- NULL
+
+  for (var in remaining) {
+    trial      <- c(selected_forward, var)
+    formula    <- as.formula(paste("Log_Impact ~",
+                                    paste(trial, collapse = " + ")))
+    model_trial <- lm(formula, data = valid_lasso)
+    r2_trial    <- summary(model_trial)$r.squared
+
+    if (r2_trial > best_r2) {
+      best_r2  <- r2_trial
+      best_var <- var
+    }
+  }
+
+  if (!is.null(best_var)) {
+    selected_forward <- c(selected_forward, best_var)
+    remaining        <- setdiff(remaining, best_var)
+    r2_growth        <- c(r2_growth, best_r2)
+  }
+}
+
+# ── Overlap analysis ──
+comparison_df <- tibble(
+  Variable = union(selected, selected_forward)
+) %>%
+  mutate(
+    LASSO   = ifelse(Variable %in% selected, "✓", ""),
+    Forward = ifelse(Variable %in% selected_forward, "✓", ""),
+    Overlap = ifelse(LASSO == "✓" & Forward == "✓", "Yes", "No")
+  ) %>%
+  arrange(desc(Overlap), Variable)
+comparison_df %>%
+  kable(
+    caption = "Q15: Variable Selection Comparison — LASSO vs Forward Selection",
+    align = "lccc"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  row_spec(which(comparison_df$Overlap == "Yes"),
+           background = "#E8F8F5") %>%   # highlight overlap
+  column_spec(2:3, bold = TRUE)
+cat(sprintf(
+  "Overlap: %d variables selected by both methods out of %d (LASSO) and %d (Forward)\n",
+  sum(comparison_df$Overlap == "Yes"),
+  length(selected),
+  length(selected_forward)
+))
+
+
+# ── R² growth plot ──
+tibble(
+  k   = seq_along(r2_growth),
+  R2  = r2_growth,
+  Var = selected_forward
+) %>%
+  ggplot(aes(x = k, y = R2)) +
+  geom_line(colour = "#457B9D", linewidth = 1.2) +
+  geom_point(colour = "#457B9D", size = 3) +
+  geom_text(aes(label = Var), hjust = -0.1, vjust = -0.5,
+            size = 3, colour = "grey40", angle = 15) +
+  scale_x_continuous(breaks = seq_along(r2_growth)) +
+  labs(
+    title    = "FIGURE-14 : Forward Selection — R² Growth by Step",
+    subtitle = "Each point labels the variable added at that step;\ndiminishing returns visible after ~5 variables",
+    x = "Number of variables in model",
+    y = "Training R²"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey50", size = 10))
+```
+
+The strongest validation comes from Figure 14, where LASSO and forward selection agree on 11 variables despite using different methods. This reduces the risk of overfitting and highlights a core set of reliable predictors. Notably, Expertise_Sim_Regular enters first and alone explains R² ~ 0.525, indicating a strong individual effect. This suggests that similarity with regular collaborators reduces impact more strongly than elite exposure increases it, supporting (Liu et al., 2018).
+
+## Q16: Cross-Validation MSE Comparison
+
+```{r q16-cv-mse}
+# ── Q16: Compare CV MSE across models ──
+lasso_cv_mse <- min(lasso_cv$cvm)
+
+# Full OLS: 10-fold CV using boot::cv.glm
+full_formula  <- as.formula(paste("Log_Impact ~",
+                                   paste(all_predictors, collapse = " + ")))
+model_full    <- glm(full_formula, data = valid_lasso)
+set.seed(40481810)
+full_cv       <- cv.glm(valid_lasso, model_full, K = 10)
+full_cv_mse   <- full_cv$delta[1]
+
+# Q9 MLR: 10-fold CV
+mlr_formula   <- as.formula(paste("Log_Impact ~",
+                                   paste(mlr_predictors, collapse = " + ")))
+model_mlr_glm <- glm(mlr_formula, data = valid_mlr)
+set.seed(40481810)
+mlr_cv        <- cv.glm(valid_mlr, model_mlr_glm, K = 10)
+mlr_cv_mse    <- mlr_cv$delta[1]
+
+# ── Summary table ──
+mse_compare <- tibble(
+  Model       = c("LASSO (lambda.min)",
+                  "Full OLS (all 17 predictors)",
+                  "MLR Q9 (8 predictors)"),
+  CV_MSE      = c(lasso_cv_mse, full_cv_mse, mlr_cv_mse),
+  N_Predictors = c(sum(coef_df$Status == "Selected"),
+                   length(all_predictors),
+                   length(mlr_predictors))
+) %>%
+  arrange(CV_MSE) %>%
+  mutate(
+    Rank = row_number(),
+    Note = case_when(
+      Rank == 1 ~ "Best out-of-sample prediction",
+      Rank == 2 ~ "",
+      Rank == 3 ~ "Worst — overfitting or omitted variables"
+    )
+  )
+
+mse_compare %>%
+  kable(digits = 4,
+        caption = "Q16: 10-Fold Cross-Validation MSE Comparison") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#F0FFF0")
+
+cat(sprintf("\nLASSO %s over Full OLS (ΔMSE = %.4f)\n",
+            ifelse(lasso_cv_mse < full_cv_mse, "IMPROVES", "does NOT improve"),
+            full_cv_mse - lasso_cv_mse))
+```
+
+## Q17: LASSO Interpretation — Which Variables Survived?
+
+```{r q17-bar, fig.width=11, fig.height=7}
+# ── Q17: LASSO coefficient bar chart ──
+# Visualising which variables were selected (non-zero) vs dropped (zero),
+# coloured by theoretical framework so the theory story is immediately visible.
+
+coef_df %>%
+  mutate(
+    Variable = fct_reorder(Variable, Coefficient),
+    Alpha_val = ifelse(Status == "Selected", 0.9, 0.3)
+  ) %>%
+  ggplot(aes(x = Variable, y = Coefficient,
+             fill = Theory, alpha = Alpha_val)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linewidth = 0.8, colour = "grey30") +
+  scale_fill_manual(values = c(
+    "Liu et al. 2018" = "#E63946",
+    "Burt 2004"       = "#457B9D",
+    "Fleming 2001"    = "#2A9D8F",
+    "General"         = "#8E8E93"
+  )) +
+  scale_alpha_identity() +
+  coord_flip() +
+  labs(
+    title    = sprintf("FIGURE-15 : LASSO Feature Selection (λ = %.5f)", optimal_lambda),
+    subtitle = "Solid bars = selected (non-zero); faded bars = dropped to zero;\ncolour = theoretical framework",
+    x = NULL,
+    y = "Standardised LASSO Coefficient",
+    fill = "Framework"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title     = element_text(face = "bold"),
+    plot.subtitle  = element_text(colour = "grey50", size = 10),
+    legend.position = "bottom"
+  )
+```
+
+The CV MSE comparison shows LASSO achieves 1.556 , compared to 2.094 (full OLS MSE])and 2.75  (MLR MSE). This improvement indicates that automated selection captures additional predictive signals. Figure 15 links these results to theory: `Network_Efficiency` has the strongest negative effect, supporting brokerage ( Burt, 2004), while `Num_Topics` is the strongest positive predictor, confirming knowledge breadth (Fleming, 2001). Elite variables show mixed effects, suggesting that elite ties improve performance only when they provide diverse, non-redundant knowledge.
+Partial R² decomposition test was performed to understand which theory dominates the most.
+
+```{r Partial R^2 Decomposition based on theories}
+#Generated and debugged using Claude AI 
+# fitting the full LASSO-selected model using plain OLS
+# Replace lasso_selected_vars with your actual selected variable names
+lasso_selected_vars <- selected  
+
+formula_full <- as.formula(paste("Log_Impact ~", 
+                                  paste(lasso_selected_vars, collapse = " + ")))
+model_full_lasso <- lm(formula_full, data = valid_lasso)
+r2_full <- summary(model_full_lasso)$r.squared
+
+# Define each theoretical group using only variables LASSO selected
+liu_vars     <- intersect(lasso_selected_vars, 
+                c("Num_Elite_Collaborators","Cohesion_Elite",
+                  "Expertise_Sim_Elite","Repeated_Elite","Projects_With_Elite"))
+
+burt_vars    <- intersect(lasso_selected_vars,
+                c("Network_Constraint","Effective_Size","Network_Efficiency"))
+
+fleming_vars <- intersect(lasso_selected_vars,
+                c("Num_Topics","Num_Domains","Total_Projects"))
+
+general_vars <- intersect(lasso_selected_vars,
+                c("Career_Length","Num_Collaborators",
+                  "Num_Regular_Collaborators","Cohesion_Regular",
+                  "Expertise_Sim_Regular","Repeated_Regular"))
+
+# For each framework, fit model WITHOUT those variables
+compute_partial_r2 <- function(drop_vars, all_vars, data) {
+  keep_vars <- setdiff(all_vars, drop_vars)
+  if (length(keep_vars) == 0) return(NA)
+  formula_reduced <- as.formula(paste("Log_Impact ~",
+                                       paste(keep_vars, collapse = " + ")))
+  model_reduced <- lm(formula_reduced, data = data)
+  r2_reduced <- summary(model_reduced)$r.squared
+  return(r2_full - r2_reduced)  # drop in R² = partial R² of removed group
+}
+
+partial_r2_liu     <- compute_partial_r2(liu_vars,     lasso_selected_vars, valid_lasso)
+partial_r2_burt    <- compute_partial_r2(burt_vars,    lasso_selected_vars, valid_lasso)
+partial_r2_fleming <- compute_partial_r2(fleming_vars, lasso_selected_vars, valid_lasso)
+partial_r2_general <- compute_partial_r2(general_vars, lasso_selected_vars, valid_lasso)
+
+# Present as a clean table
+tibble(
+  Framework       = c("Liu et al. 2018", "Burt 2004", "Fleming 2001", "General"),
+  Variables_Used  = c(length(liu_vars), length(burt_vars), 
+                       length(fleming_vars), length(general_vars)),
+  Partial_R2      = c(partial_r2_liu, partial_r2_burt, 
+                       partial_r2_fleming, partial_r2_general),
+  Pct_of_Full_R2  = c(partial_r2_liu, partial_r2_burt,
+                       partial_r2_fleming, partial_r2_general) / r2_full * 100
+) %>%
+  arrange(desc(Partial_R2)) %>%
+  kable(digits = 4,
+        caption = "Partial R² by Theoretical Framework — LASSO Selected Variables",
+        col.names = c("Framework", "Variables", "Partial R²", "% of Full R²")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#FFF3CD")
+```
+
+# Part 4: Classification Models 
+
+## Q18–Q21: Logistic Regression
+
+```{r q18-logistic}
+# Using LASSO-selected predictors (excluding regression targets)
+classif_predictors <- setdiff(selected, c("Total_Impact", "Log_Impact"))
+if (length(classif_predictors) < 3) {
+  classif_predictors <- c("Total_Projects", "Career_Length", "Num_Elite_Collaborators",
+                           "Cohesion_Elite", "Effective_Size", "Num_Topics")
+}
+cat("Classification predictors:", paste(classif_predictors, collapse = ", "), "\n")
+
+valid_class <- df %>% select(Is_HighPerformer, all_of(classif_predictors)) %>% drop_na()
+cat(sprintf("Observations: %d\n", nrow(valid_class)))
+cat(sprintf("Class distribution: 1=%d (%.1f%%), 0=%d (%.1f%%)\n",
+            sum(valid_class$Is_HighPerformer == 1),
+            100 * mean(valid_class$Is_HighPerformer == 1),
+            sum(valid_class$Is_HighPerformer == 0),
+            100 * mean(valid_class$Is_HighPerformer == 0)))
+```
+
+```{r q19-metrics}
+# Train/test split (70/30, stratified)
+train_idx <- createDataPartition(valid_class$Is_HighPerformer, p = 0.7, list = FALSE)
+train_data <- valid_class[train_idx, ]
+test_data  <- valid_class[-train_idx, ]
+
+# Fit logistic regression
+formula_logit <- as.formula(paste("Is_HighPerformer ~", paste(classif_predictors, collapse = " + ")))
+model_logit <- glm(formula_logit, data = train_data, family = binomial)
+# Predicted probabilities on test data
+pred_prob_lr <- predict(model_logit, newdata = test_data, type = "response")
+summary(model_logit)
+```
+```{r threshold for logistic }
+#To find the optima, threshold for practically efficient output 
+# Define thresholds
+thresholds <- seq(0.1, 0.9, by = 0.1)
+
+# Compute metrics
+metrics <- sapply(thresholds, function(t) {
+  preds <- ifelse(pred_prob_lr > t, 1, 0)
+  
+  cm <- confusionMatrix(
+    factor(preds, levels = c(0, 1)),
+    factor(test_data$Is_HighPerformer, levels = c(0, 1)),
+    positive = "1"
+  )
+  
+  precision <- cm$byClass["Precision"]
+  recall    <- cm$byClass["Sensitivity"]
+  accuracy  <- cm$overall["Accuracy"]
+  
+  f1 <- ifelse((precision + recall) == 0, 0,
+               2 * (precision * recall) / (precision + recall))
+  
+  c(Accuracy = accuracy,
+    Recall   = recall,
+    F1       = f1)
+})
+
+metrics <- as.data.frame(t(metrics))
+
+# Combined score (balanced decision)
+combined <- (metrics$Accuracy + metrics$Recall + metrics$F1) / 3
+
+# Best threshold
+best_idx <- which.max(combined)
+best_t   <- thresholds[best_idx]
+
+par(mar = c(5, 5, 6, 2))
+
+plot(thresholds, metrics$Accuracy, type = "b",
+     pch = 19, lwd = 2,
+     col = "#1f77b4",   # Blue
+     ylim = c(0, 1),
+     main = "FIGURE 16 :Logistic Regression: Metrics vs Threshold",
+     xlab = "Threshold", ylab = "Value")
+
+lines(thresholds, metrics$Recall, type = "b",
+      pch = 17, lwd = 2,
+      col = "#d62728")  # Red
+
+lines(thresholds, metrics$F1, type = "b",
+      pch = 15, lwd = 2,
+      col = "#2ca02c")  # Green
+
+grid()
+
+# Vertical line for best threshold
+abline(v = best_t, lty = 2, lwd = 2, col = "black")
+
+# Highlight best points
+points(best_t, metrics$Accuracy[best_idx], pch = 19, cex = 1.5, col = "#1f77b4")
+points(best_t, metrics$Recall[best_idx],   pch = 17, cex = 1.5, col = "#d62728")
+points(best_t, metrics$F1[best_idx],       pch = 15, cex = 1.5, col = "#2ca02c")
+
+# Label
+text(best_t, max(metrics[best_idx, ]),
+     labels = sprintf("Best = %.2f", best_t),
+     pos = ifelse(max(metrics[best_idx, ]) > 0.95, 1, 3))
+
+# Legend
+legend("bottomleft",
+       legend = c("Accuracy", "Recall", "F1", "Best Threshold"),
+       col = c("#1f77b4", "#d62728", "#2ca02c", "black"),
+       pch = c(19, 17, 15, NA),
+       lty = c(1, 1, 1, 2),
+       lwd = 2,
+       cex = 0.9)
+```
+
+## Odds Ratio
+
+```{r q20-odds}
+# Odds ratios
+cat("\nQ20: Odds Ratios:\n")
+odds_df <- tibble(
+  Variable   = names(coef(model_logit)),
+  Coefficient = coef(model_logit),
+  Odds_Ratio  = exp(coef(model_logit))
+)
+odds_df %>%
+  kable(digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+The logistic regression results identify clear structural drivers of star classification. `Expertise_Sim_Elite` (OR = 2.65) and `Cohesion_Elite` (OR = 2.42) are the strongest positive predictors, indicating that knowledge proximity and embeddedness within elite networks significantly increase the likelihood of high performance. `Repeated_Elite` (OR = 1.62) and `Total_Projects` (OR = 1.15) contribute more modestly, reflecting a compounding but secondary role. In contrast, `Expertise_Sim_Regular` (OR ≈ 0.00) and `Network_Constraint` (OR = 0.15) act as strong negative predictors, showing that alignment with non-elite collaborators and structurally constrained networks reduce the probability of star emergence. These findings support both the mirror effect and structural holes theory.
+
+
+```{r q21 test set predictions }
+# Test set predictions
+pred_prob_lr <- predict(model_logit, newdata = test_data, type = "response")
+pred_class_lr <- ifelse(pred_prob_lr > 0.2, 1, 0)
+
+cm_lr <- confusionMatrix(factor(pred_class_lr, levels = c(0, 1)),
+                          factor(test_data$Is_HighPerformer, levels = c(0, 1)),
+                          positive = "1")
+cat("\nQ19: Logistic Regression — Test Set Performance\n")
+cat(sprintf("  Accuracy:  %.4f\n", cm_lr$overall["Accuracy"]))
+cat(sprintf("  Precision: %.4f\n", cm_lr$byClass["Precision"]))
+cat(sprintf("  Recall:    %.4f\n", cm_lr$byClass["Sensitivity"]))
+print(cm_lr$table)
+```
+
+## Q22–Q24: Linear Discriminant Analysis
+
+```{r q22-lda}
+##preparing the LDA model
+model_lda <- lda(formula_logit, data = train_data)
+pred_lda <- predict(model_lda, newdata = test_data)
+
+cm_lda <- confusionMatrix(pred_lda$class,
+                           factor(test_data$Is_HighPerformer, levels = c(0, 1)),
+                           positive = "1")
+cat("Q23: LDA — Test Set Performance\n")
+cat(sprintf("  Accuracy:  %.4f\n", cm_lda$overall["Accuracy"]))
+cat(sprintf("  Precision: %.4f\n", cm_lda$byClass["Precision"]))
+cat(sprintf("  Recall:    %.4f\n", cm_lda$byClass["Sensitivity"]))
+print(cm_lda$table)
+
+
+```
+
+```{r Model Comparison}
+cat("\nQ24: Model Comparison\n")
+tibble(
+  Metric    = c("Accuracy", "Precision", "Recall", "F1 Score"),
+  Logistic  = c(cm_lr$overall["Accuracy"], cm_lr$byClass["Precision"], cm_lr$byClass["Sensitivity"], cm_lr$byClass["F1"]),
+  LDA       = c(cm_lda$overall["Accuracy"], cm_lda$byClass["Precision"], cm_lda$byClass["Sensitivity"], cm_lda$byClass["F1"])
+) %>%
+  kable(digits = 4, caption = "Q24: Logistic vs LDA Comparison") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+```{r q24-roc, fig.width=8, fig.height=7}
+# ROC Curve comparison Logistic v/s lasso
+roc_lr  <- roc(test_data$Is_HighPerformer, pred_prob_lr)
+roc_lda <- roc(test_data$Is_HighPerformer, pred_lda$posterior[, "1"])
+
+plot(roc_lr, col = "#E63946", lwd = 2,
+     main = "FIGUE 17 : ROC Curves — Logistic vs LDA")
+plot(roc_lda, col = "#457B9D", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+legend("bottomright",
+       legend = c(sprintf("Logistic (AUC = %.3f)", auc(roc_lr)),
+                  sprintf("LDA (AUC = %.3f)", auc(roc_lda))),
+       col = c("#E63946", "#457B9D"), lwd = 2)
+```
+ROC analysis shows both models have excellent discriminative ability (AUC >0.98), indicating near-perfect separation between stars and non-stars . However, logistic regression offers greater practical value due to its threshold flexibility, allowing better control over precision–recall trade-offs. Overall, the classification results reinforce earlier findings, demonstrating that elite knowledge proximity, network openness, and avoidance of redundant peer similarity are robust predictors of star performance.
+
+
+## Class Imbalance Discussion 
+
+```{r q25-imbalance}
+cat("Q25: Class Imbalance Discussion\n")
+cat(sprintf("  Non-Elite (0): %d (%.1f%%)\n",
+            sum(valid_class$Is_HighPerformer == 0),
+            100 * mean(valid_class$Is_HighPerformer == 0)))
+cat(sprintf("  Elite     (1): %d (%.1f%%)\n",
+            sum(valid_class$Is_HighPerformer == 1),
+            100 * mean(valid_class$Is_HighPerformer == 1)))
+```
+The classification analysis evaluates whether the theoretical predictors identified earlier i.e elite exposure, network structure, and expertise characteristics can accurately distinguish high performers from the majority of researchers. Given that 87.7% of the dataset consists of non-elite individuals, accuracy alone is misleading, as a naive model predicting all observations as non-elite would already achieve high accuracy. Therefore, confusion matrices provide a more meaningful assessment. Logistic regression, using a calibrated threshold of 0.2, achieves a recall of 95.03%, correctly identifying most high performers, though at the cost of lower precision (74.96%) due to false positives. In contrast, LDA yields higher precision (85.80%) but substantially lower recall (78.44%), missing many true high performers.Logistic regression is therefore preferred, as its higher recall ensures emerging stars are not overlooked and its flexible threshold allows adjustment of the precision–recall trade-off. This is further supported by statistical learning theory, as logistic regression makes fewer distributional assumptions than LDA (James et al., 2021).
+
+# Part 5: Interaction Effects and Insights 
+
+---
+
+## Q26: Interaction Term — Number of Elite collaborators × Elite Cohesion
+
+
+The interaction analysis tests Liu et al.’s (2018) that the value of elite contacts depends on their structure rather than quantity. The heatmap shows that among researchers with many elite contacts, those with low cohesion reach a star probability of 92%, compared to just 23% at high cohesion.The fan plot reinforces this finding, at high cohesion (0.83), predicted star probability remains flat near zero regardless of how many elite contacts a researcher accumulates, while at low cohesion the curve rises sharply beyond ten contacts. The negative interaction coefficient (–0.153, OR = 0.858, p < 2e-16) and deviance reduction of 921 provide strong statistical support. Together, these results show that while Cohesion_Elite has a positive main effect, excessive cohesion reduces the marginal value of elite ties due to informational redundancy.
+
+```{r q 26 Interaction model  }
+#Testing the effects of interaction 
+
+# Add interaction term to the existing base formula
+formula_interaction <- update(formula_logit, 
+                               . ~ . + Num_Elite_Collaborators:Cohesion_Elite)
+
+model_interaction <- glm(formula_interaction, data = train_data, family = binomial)
+
+# Extract interaction term specifically
+int_coef <- summary(model_interaction)$coefficients
+int_row  <- int_coef["Cohesion_Elite:Num_Elite_Collaborators", ]
+
+cat("Q26: Interaction Term — Num_Elite_Collaborators × Cohesion_Elite\n")
+cat(sprintf("  Coefficient: %.4f\n", int_row["Estimate"]))
+cat(sprintf("  Odds Ratio:  %.4f\n", exp(int_row["Estimate"])))
+cat(sprintf("  p-value:     %.6f\n", int_row["Pr(>|z|)"]))
+cat(sprintf("  Significant: %s\n",   ifelse(int_row["Pr(>|z|)"] < 0.05, "YES", "NO")))
+
+# Model fit comparison — reusing model_logit from Part 4
+tibble(
+  Model     = c("Base Logistic (Part 4)", "With Interaction"),
+  AIC       = c(AIC(model_logit), AIC(model_interaction)),
+  Resid_Dev = c(model_logit$deviance, model_interaction$deviance)
+) %>%
+  kable(digits = 4, caption = "Q26: Model Fit — Base vs Interaction") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+# Likelihood Ratio Test — model_logit is the benchmark
+lrt <- anova(model_logit, model_interaction, test = "Chisq")
+print(lrt)
+```
+```{r q26-heatmap, fig.width=11, fig.height=7}
+#  Raw interaction heatmap 
+
+inter_heat <- df %>%
+  select(Is_HighPerformer, Num_Elite_Collaborators, Cohesion_Elite) %>%
+  drop_na() %>%
+  mutate(
+    Elite_Bin    = ntile(Num_Elite_Collaborators, 6),
+    Cohesion_Bin = ntile(Cohesion_Elite, 6)
+  ) %>%
+  group_by(Elite_Bin, Cohesion_Bin) %>%
+  summarise(P_Star = mean(Is_HighPerformer), n = n(), .groups = "drop")
+
+overall_p <- mean(df$Is_HighPerformer, na.rm = TRUE)
+
+ggplot(inter_heat,
+       aes(x = factor(Elite_Bin), y = factor(Cohesion_Bin), fill = P_Star)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.0f%%\n(n=%d)", P_Star * 100, n)),
+            size = 3.2, colour = "black") +
+  scale_fill_gradient2(
+    low      = "#457B9D",
+    mid      = "#FFFFCC",
+    high     = "#E63946",
+    midpoint = overall_p,
+    limits   = c(0, 1),
+    name     = "P(Star)"
+  ) +
+  labs(
+    title    = "FIGURE 18:Raw Interaction: Elite Collaborators × Elite Cohesion → P(Star)",
+    subtitle = sprintf(
+      "Overall star rate = %.1f%%\nDoes high cohesion amplify (+) or dilute (−) the elite contact benefit?",
+      100 * overall_p),
+    x = "Num_Elite_Collaborators (1 = fewest → 6 = most)",
+    y = "Cohesion_Elite (1 = lowest → 6 = highest)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey50", size = 10))
+```
+
+The figure below shows the moderation effect of cohesion on the relationship between elite contacts and star probability.
+
+```{r fan plot  }
+#  Model-adjusted predicted probability fan 
+#Used chatGPT to debug here 
+
+# 1. Dynamically identify all predictors used in the model
+all_predictors <- all.vars(formula_interaction)[-1]
+
+# 2. Means of all predictors 
+mean_vals <- train_data %>%
+  summarise(across(all_of(all_predictors), ~ mean(.x, na.rm = TRUE)))
+
+# 3. Cohesion levels (10th, 50th, 90th percentile)
+coh_levels <- quantile(train_data$Cohesion_Elite,
+                        probs = c(0.10, 0.50, 0.90), na.rm = TRUE)
+
+coh_labels <- c(
+  sprintf("Low cohesion (%.2f)", coh_levels[1]),
+  sprintf("Median cohesion (%.2f)", coh_levels[2]),
+  sprintf("High cohesion (%.2f)", coh_levels[3])
+)
+
+# 4. Range of elite collaborators (up to 95th percentile to avoid extreme outliers)
+elite_range <- seq(
+  min(train_data$Num_Elite_Collaborators, na.rm = TRUE),
+  quantile(train_data$Num_Elite_Collaborators, 0.95, na.rm = TRUE),
+  length.out = 120
+)
+
+# 5. Create prediction data
+fan_df <- purrr::map2_dfr(as.list(coh_levels), coh_labels, function(coh_val, lbl) {
+  
+  # Start with mean values for ALL predictors
+  nd <- mean_vals[rep(1, length(elite_range)), ]
+  
+  
+  nd$Num_Elite_Collaborators <- elite_range
+  nd$Cohesion_Elite          <- coh_val
+  
+ 
+  tibble(
+    Num_Elite  = elite_range,
+    Prob_Star  = predict(model_interaction, newdata = nd, type = "response"),
+    Cohesion_Group = lbl
+  )
+})
+
+fan_df <- fan_df %>%
+  mutate(Cohesion_Group = factor(Cohesion_Group, levels = coh_labels))
+
+# 6. Plot
+ggplot(fan_df, aes(x = Num_Elite, y = Prob_Star,
+                    colour = Cohesion_Group, linetype = Cohesion_Group)) +
+  geom_line(linewidth = 1.2) +
+  scale_colour_manual(values = c("#2A9D8F", "#F4A261", "#E63946")) +
+  scale_linetype_manual(values = c("dotted", "dashed", "solid")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "FIGURE 19 : Moderation Effect of Network Cohesion",
+    subtitle = "Predicted probability of Star status across elite collaborators at different cohesion levels",
+    x        = "Number of Elite Collaborators",
+    y        = "Predicted Probability of Being a Star",
+    colour   = "Cohesion level",
+    linetype = "Cohesion level"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+
+## Q27: Interpretation — Does Cohesion Facilitate Skill Transfer?
+
+The results offer partial support for Liu et al. (2018). The main effect of Cohesion_Elite is positive and significant (H1 ✓), confirming that elite embeddedness facilitates skill transfer, but the negative interaction term (H2 ✓) reveals a boundary condition where high cohesion becomes counterproductive as elite contacts accumulate, due to informational redundancy.
+
+```{r hypothesis evaluation }
+# ── Q27: Directional hypothesis evaluation ──
+
+#testing Liu's two central hypothesis 
+all_coefs <- summary(model_interaction)$coefficients
+ci_int    <- suppressMessages(confint.default(model_interaction))
+
+
+int_term_name <- grep("Cohesion_Elite:Num_Elite_Collaborators|Num_Elite_Collaborators:Cohesion_Elite", 
+                      rownames(all_coefs), value = TRUE)
+
+hypothesis_tbl <- tibble(
+  Hypothesis = c(
+    "H1: Cohesion_Elite main effect is POSITIVE",
+    "H2: Interaction (Num_Elite × Cohesion_Elite) is NEGATIVE"
+  ),
+  Variable = c("Cohesion_Elite", int_term_name),
+  Estimate = c(
+    all_coefs["Cohesion_Elite", "Estimate"],
+    all_coefs[int_term_name, "Estimate"]
+  ),
+  CI_Low = c(
+    ci_int["Cohesion_Elite", 1],
+    ci_int[int_term_name, 1]
+  ),
+  CI_High = c(
+    ci_int["Cohesion_Elite", 2],
+    ci_int[int_term_name, 2]
+  ),
+  p_value = c(
+    all_coefs["Cohesion_Elite", "Pr(>|z|)"],
+    all_coefs[int_term_name, "Pr(>|z|)"]
+  ),
+  Odds_Ratio = exp(Estimate),
+  Supported = c(
+    # H1: Check if Estimate is positive AND p-value < 0.05
+    ifelse(all_coefs["Cohesion_Elite", "Estimate"] > 0 & 
+             all_coefs["Cohesion_Elite", "Pr(>|z|)"] < 0.05, 
+           "Yes ✓", "No ✗"),
+    # H2: Check if Estimate is negative AND p-value < 0.05
+    ifelse(all_coefs[int_term_name, "Estimate"] < 0 & 
+             all_coefs[int_term_name, "Pr(>|z|)"] < 0.05, 
+           "Yes ✓", "No ✗")
+  )
+)
+
+# ── Render the Hypothesis Table ──
+hypothesis_tbl %>%
+  kable(digits = 4, 
+        caption = "Q27: Formal Evaluation of Interaction Hypotheses (Liu et al., 2018)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = TRUE) %>%
+  row_spec(which(hypothesis_tbl$Supported == "Yes ✓"), 
+           background = "#D4EDDA") %>% 
+  row_spec(which(hypothesis_tbl$Supported == "No ✗"), 
+           background = "#F8D7DA")
+```
+
+---
+
+## Q28: The Mirror Effect — Cohesion_Elite vs Cohesion_Regular
+
+This is extended by the mirror effect analysis, where Cohesion_Elite (+5.357) and Cohesion_Regular (–9.177) have large, significant effects in opposite directions (p < 0.001). The mirror plot shows that increasing elite cohesion reduces star probability, while regular cohesion independently suppresses it further. The same structural feature thus produces opposite outcomes depending on collaborator quality, providing strong support for Liu et al.’s tacit knowledge transfer argument.
+
+```{r q28-mirror-model}
+# ── Q28: Formally test the mirror effect ──
+# Liu et al.'s most striking prediction is the SYMMETRY of the cohesion effect:
+
+options(scipen = 0)
+mirror_df <- df %>%
+  select(Is_HighPerformer,
+         Cohesion_Elite, Cohesion_Regular,
+         Career_Length, Num_Elite_Collaborators, Effective_Size) %>%
+  drop_na()
+
+set.seed(40481810)
+train_idx_m <- sample(nrow(mirror_df), floor(0.7 * nrow(mirror_df)))
+train_m <- mirror_df[ train_idx_m, ]
+test_m  <- mirror_df[-train_idx_m, ]
+
+mod_mirror <- glm(
+  Is_HighPerformer ~ Cohesion_Elite + Cohesion_Regular +
+    Career_Length + Num_Elite_Collaborators + Effective_Size,
+  data = train_m, family = binomial
+)
+
+cat("Q28: Mirror Effect Model Coefficients\n")
+print(summary(mod_mirror)$coefficients)
+
+coef_elite   <- coef(mod_mirror)["Cohesion_Elite"]
+coef_regular <- coef(mod_mirror)["Cohesion_Regular"]
+
+cat(sprintf("\n  Cohesion_Elite coefficient:   %+.4f\n", coef_elite))
+cat(sprintf("  Cohesion_Regular coefficient: %+.4f\n",  coef_regular))
+
+if (coef_elite > 0 & coef_regular < 0) {
+  cat("  ✓ Opposite signs — consistent with Liu et al. (2018) mirror effect\n")
+} else {
+  cat("  Signs to be interpreted carefully in context of the data\n")
+}
+```
+
+```{r q28-mirror-plot, fig.width=14, fig.height=6}
+# ── Mirror effect visualisation: model-adjusted probability curves ──
+
+pred_band_fn <- function(model, newdata, xvar, type_label) {
+  pr <- predict(model, newdata = newdata, type = "link", se.fit = TRUE)
+  tibble(
+    x    = newdata[[xvar]],
+    fit  = plogis(pr$fit),
+    lo   = plogis(pr$fit - 1.96 * pr$se.fit),
+    hi   = plogis(pr$fit + 1.96 * pr$se.fit),
+    Type = type_label
+  )
+}
+
+meds_m <- mirror_df %>%
+  summarise(across(everything(), ~ median(.x, na.rm = TRUE)))
+
+x_seq <- seq(0, 1, length.out = 200)
+
+nd_elite <- tibble(
+  Cohesion_Elite           = x_seq,
+  Cohesion_Regular         = meds_m$Cohesion_Regular,
+  Career_Length            = meds_m$Career_Length,
+  Num_Elite_Collaborators  = meds_m$Num_Elite_Collaborators,
+  Effective_Size           = meds_m$Effective_Size
+)
+nd_regular <- tibble(
+  Cohesion_Elite           = meds_m$Cohesion_Elite,
+  Cohesion_Regular         = x_seq,
+  Career_Length            = meds_m$Career_Length,
+  Num_Elite_Collaborators  = meds_m$Num_Elite_Collaborators,
+  Effective_Size           = meds_m$Effective_Size
+)
+
+mirror_curves <- bind_rows(
+  pred_band_fn(mod_mirror, nd_elite,   "Cohesion_Elite",   "Elite ties → helps (Liu H1)"),
+  pred_band_fn(mod_mirror, nd_regular, "Cohesion_Regular", "Regular ties → hurts (Liu mirror)")
+)
+
+ggplot(mirror_curves, aes(x = x, y = fit,
+                          colour = Type, fill = Type)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi),
+              alpha = 0.15, linewidth = 0, show.legend = FALSE) +
+  geom_line(linewidth = 1.4) +
+  geom_hline(yintercept = mean(mirror_df$Is_HighPerformer),
+             linetype = "dotted", colour = "grey45", linewidth = 0.8) +
+  annotate("text", x = 0.75, y = mean(mirror_df$Is_HighPerformer) + 0.01,
+           label = "Population average", colour = "grey45", size = 3.2) +
+  scale_colour_manual(values = c(
+    "Elite ties → helps (Liu H1)"     = "#E63946",
+    "Regular ties → hurts (Liu mirror)" = "#457B9D"
+  )) +
+  scale_fill_manual(values = c(
+    "Elite ties → helps (Liu H1)"     = "#E63946",
+    "Regular ties → hurts (Liu mirror)" = "#457B9D"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "FIGURE 20 : The Mirror Effect — Same Structure, Opposite Consequences",
+    subtitle = "Model-adjusted P(Star) as each cohesion variable varies from 0 to 1\n(all other predictors held at median; shading = 95% CI)",
+    x        = "Cohesion value (0 = loose network  →  1 = tight clique)",
+    y        = "Predicted P(High Performer)",
+    colour   = NULL, fill = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    plot.subtitle   = element_text(colour = "grey50", size = 10),
+    legend.position = "bottom"
+  )
+```
+
+---
+
+## Q29: Final Synthesis — Strategic Advice for Aspiring Stars
+
+```{r q29-profile-chart, fig.width=13, fig.height=7}
+# ── Q29 Visualisation: Star vs Non-Star profile comparison ──
+# We compute the average PERCENTILE RANK of each key variable
+# for stars and non-stars separately. Percentile ranks are on a common
+# [0,1] scale regardless of the original variable's units, making
+# profiles directly comparable across very different measures.
+
+
+profile_vars <- c(
+  "Career_Length", "Num_Elite_Collaborators",
+  "Cohesion_Elite", "Cohesion_Regular",
+  "Network_Constraint", "Effective_Size",
+  "Num_Topics", "Total_Projects"
+)
+
+profile_df <- df %>%
+  select(Is_HighPerformer, all_of(profile_vars)) %>%
+  drop_na() %>%
+  mutate(across(all_of(profile_vars), percent_rank)) %>%
+  group_by(Is_HighPerformer) %>%
+  summarise(across(all_of(profile_vars), mean), .groups = "drop") %>%
+  mutate(Status = factor(Is_HighPerformer,
+                         labels = c("Non-Star", "Star"))) %>%
+  select(-Is_HighPerformer) %>%
+  pivot_longer(-Status, names_to = "Variable", values_to = "Percentile") %>%
+  mutate(
+    # Invert constraint: lower constraint = more brokerage = better
+    Display = ifelse(Variable == "Network_Constraint",
+                     1 - Percentile, Percentile),
+    Variable_Label = recode(Variable,
+      Career_Length            = "Career Length",
+      Num_Elite_Collaborators  = "Elite Contacts",
+      Cohesion_Elite           = "Elite Cohesion",
+      Cohesion_Regular         = "Regular Cohesion",
+      Network_Constraint       = "Broker Position\n(1 − Constraint)",
+      Effective_Size           = "Effective Network\nSize",
+      Num_Topics               = "Knowledge\nBreadth",
+      Total_Projects           = "Output Depth"
+    ),
+    Variable_Label = factor(Variable_Label, levels = unique(Variable_Label))
+  )
+
+ggplot(profile_df,
+       aes(x = Variable_Label, y = Display, fill = Status)) +
+  geom_col(position = "dodge", alpha = 0.88, width = 0.68) +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             colour = "grey50", linewidth = 0.8) +
+  annotate("text", x = 0.6, y = 0.525,
+           label = "Population median", size = 3.2, colour = "grey50") +
+  scale_fill_manual(values = c("Non-Star" = "#457B9D", "Star" = "#E63946")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(
+    title    = "FIGURE 21 : The Star Profile — Eight Dimensions That Separate Stars from Non-Stars",
+    subtitle = "Average percentile rank on each dimension; all bars above 50% = above population median\nBroker Position = 1 − Network_Constraint (higher = more structural holes)",
+    x        = NULL,
+    y        = "Average Percentile Rank",
+    fill     = "Status"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    plot.subtitle   = element_text(colour = "grey50", size = 10),
+    axis.text.x     = element_text(size = 10),
+    legend.position = "top"
+  )
+```
+
+The star profile (Figure 21) synthesises all five parts. Elite exposure is the dominant strategy: star probability rises from 0.1% to 83.1% as elite contacts increase, with the first tie delivering the steepest gain (Figure 7). These ties must span diverse communities, as the interaction analysis (Q26--Q27) shows high cohesion at scale produces redundancy and diminishing returns. Occupying broker positions with low `Network_Constraint`, retained by LASSO, provides access to non-redundant information (Burt, 2004). Investing in interdisciplinary breadth further strengthens impact, with `Num_Topics` emerging as the strongest MLR predictor ($\beta^* = 0.40$). Most critically, dense regular peer networksmust be avoided, as `Cohesion_Regular` is the sharpest negative predictor (coefficient $= -9.177$, $p < 0.001$), suppressing impact regardless of individual productivity.
+
+---
+
+# Discussion and Conclusion 
+
+Across all five parts, elite network exposure, structural openness, and avoidance of regular peer embeddedness consistently emerge as the defining conditions of star performance. Liu et al. (2018) receives the strongest empirical support, validated across regression, classification, and interaction analyses, and the partial R2R^2
+R2 decomposition in Part 3. Fleming (2001) is also well supported, with knowledge breadth acting as an independent predictor of impact. Burt (2004) shows meaningful but partly obscured effects due to multicollinearity between structural variables. These findings further align with Granovetter (1973), who highlights the importance of accessing diverse, non-redundant information. However, causality cannot be established, network dynamics over time remain unobserved, and distributional limitations reduce the reliability of LDA.
+
+For researchers seeking to maximise long-term impact, the evidence converges on four concrete priorities. Building collaborations with elite performers delivers the highest return of any single networking investment. These ties should span structurally disconnected communities, as concentration within a single group quickly leads to redundant information and reduced performance gains. Continued investment in interdisciplinary knowledge further strengthens these advantages over time. Most importantly, strong embeddedness in regular peer networks should be avoided, as redundant ties can reduce citation impact regardless of productivity.
+
+
+# Code Explanation
+
+<span style="color:red">
+
+## Data Loading and Preprocessing
+
+The dataset was loaded using **`read_csv`** and immediately log-transformed via **`log(Total_Impact + 1)`**. This was necessary because **`Total_Impact`** exhibited extreme right skew (*skewness = 284.2*), violating the *normality* and *homoscedasticity* assumptions required for OLS regression. The constant 1 prevents undefined values for zero-citation researchers. Post-transformation skewness fell to *0.35*, confirming suitability for linear modelling.
+
+Missing values were handled *selectively* rather than through blanket imputation. Variables capturing elite network absence --- **`Cohesion_Elite`**, **`Expertise_Sim_Elite`**, and **`Repeated_Elite`** --- were zero-filled, reflecting the theoretical reality that a researcher with no elite collaborators genuinely scores zero on these dimensions. Remaining missing values were addressed through *listwise deletion* at the model-fitting stage, preserving distributional integrity. An NA audit table verified corrections before and after.
+
+## Exploratory Data Analysis
+
+Summary statistics and a correlation matrix were computed to identify distributional properties and multicollinearity risks before modelling. Pairs exceeding $|r| > 0.7$ were flagged programmatically. Boxplots and density plots compared star and non-star distributions across key variables, establishing the theoretical hierarchy --- *elite exposure*, *structural brokerage*, and *knowledge breadth* --- that guided model specification.
+
+## Linear Regression
+
+Simple, multiple, and polynomial regression models were fitted using **`lm()`**. Predictors were *standardised* before fitting to enable direct effect-size comparison across variables on different scales. VIF values were computed using the **`car`** package to quantify multicollinearity. Residual diagnostics confirmed the log-transformation substantially improved assumption compliance, though some *heteroscedasticity* remained at high fitted values.
+
+## LASSO Regularisation
+
+LASSO was fitted using **`cv.glmnet`** with **`alpha = 1`**. All predictors were *standardised* prior to entry, as LASSO penalises coefficients relative to scale and unstandardised inputs produce disproportionate shrinkage. *Ten-fold cross-validation* selected the optimal lambda minimising CV MSE. Forward selection was run independently using marginal $R^2$ improvement at each step, providing a second validation method. Agreement between both approaches on *11 variables* confirmed robustness of the selected predictor set.
+
+## Classification Models
+
+Logistic regression was fitted using **`glm()`** with **`family = binomial`**. A *stratified 70/30 train-test split* via **`createDataPartition`** preserved the minority class proportion across partitions. A threshold sweep from *0.1 to 0.9* identified *0.2* as optimal by maximising a combined *Accuracy--Recall--F1* score, prioritising minority class detection given the *87.7/12.3* imbalance. LDA was fitted using the **`MASS`** package. ROC curves and AUC values were computed using **`pROC`**.
+
+## Interaction and Reproducibility
+
+The interaction model extended the base logistic formula using **`update()`**, reusing the existing Part 4 model object. Model improvement was confirmed via *likelihood ratio testing* using **`anova()`**. The mirror effect model was rebuilt from the full dataset to include **`Cohesion_Regular`**, which had been excluded during earlier preprocessing. Intermediate outputs and model inputs were checked for consistency in dimensions and missing values prior to fitting. A fixed random seed of *40481810* was applied throughout to ensure full reproducibility.
+
+</span>
+
+# References
+
+Burt, R.S. (2004) ‘Structural holes and good ideas’, *American Journal of Sociology*, 110(2), pp. 349–399.
+
+Fleming, L. (2001) ‘Recombinant uncertainty in technological search’, *Management Science*, 47(1), pp. 117–132.
+
+James, G., Witten, D., Hastie, T. and Tibshirani, R. (2021) *An Introduction to Statistical Learning: with Applications in R*. 2nd edn. New York: Springer.
+
+Liu, X., Uzzi, B., Evans, J.A. and others (2018) ‘A network perspective on the relationship between collaboration and scientific impact’, *Nature Communications*, 9(1), pp. 1–10.
+
+Merton, R.K. (1968) ‘The Matthew effect in science’, *Science*, 159(3810), pp. 56–63.
+
+Uzzi, B. (1997) ‘Social structure and competition in interfirm networks: The paradox of embeddedness’, *Administrative Science Quarterly*, 42(1), pp. 35–67.
+
+Granovetter, M.S. (1973) ‘The strength of weak ties’, *American Journal of Sociology*, 78(6), pp. 1360–1380.
+
+# Appendix
+
+## A.1: Additional Exploratory Plots
+
+```{r appendix-skew-comparison, fig.width=10, fig.height=5}
+# Manual skewness function 
+skewness_manual <- function(x) {
+  x  <- x[!is.na(x)]
+  n  <- length(x)
+  m  <- mean(x)
+  s  <- sd(x)
+  (n / ((n - 1) * (n - 2))) * sum(((x - m) / s)^3)
+}
+
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+hist(df$Total_Impact, breaks = 80, col = "#457B9D", border = "white",
+     main = sprintf("Raw Total_Impact\nSkewness = %.1f", skewness_manual(df$Total_Impact)),
+     xlab = "Total Impact", probability = TRUE)
+abline(v = mean(df$Total_Impact),   col = "orange", lwd = 2, lty = 2)
+abline(v = median(df$Total_Impact), col = "#E63946", lwd = 2, lty = 2)
+legend("topright", legend = c("Mean", "Median"),
+       col = c("orange", "#E63946"), lty = 2, lwd = 2, cex = 0.85)
+
+hist(df$Log_Impact, breaks = 60, col = "#2A9D8F", border = "white",
+     main = sprintf("log(Total_Impact + 1)\nSkewness = %.2f", skewness_manual(df$Log_Impact)),
+     xlab = "log(Total Impact + 1)", probability = TRUE)
+abline(v = mean(df$Log_Impact),   col = "orange", lwd = 2, lty = 2)
+abline(v = median(df$Log_Impact), col = "#E63946", lwd = 2, lty = 2)
+
+par(mfrow = c(1, 1))
+```
+
+*The left panel illustrates the extreme right-skew of raw `Total_Impact` (skewness ≈ 284); the log transformation brings it close to symmetry (skewness ≈ 0.35), justifying its use as the regression outcome.*
+
+```{r appendix-career-elite-heatmap, fig.width=9, fig.height=7}
+# Heatmap: Career_Length × Num_Elite_Collaborators → P(Star)
+# Motivated by the results of Q5
+
+career_heat <- df %>%
+  select(Is_HighPerformer, Career_Length, Num_Elite_Collaborators) %>%
+  drop_na() %>%
+  mutate(
+    Career_Bin = ntile(Career_Length, 15),
+    Elite_Bin  = ntile(Num_Elite_Collaborators, 15)
+  ) %>%
+  group_by(Career_Bin, Elite_Bin) %>%
+  summarise(P_Star = mean(Is_HighPerformer), n = n(), .groups = "drop")
+
+overall_rate <- mean(df$Is_HighPerformer, na.rm = TRUE)
+
+ggplot(career_heat, aes(x = factor(Elite_Bin), y = factor(Career_Bin), fill = P_Star)) +
+  geom_tile(colour = "white", linewidth = 0.35) +
+  scale_fill_gradient2(
+    low      = "#457B9D",
+    mid      = "#FFF7BC",
+    high     = "#E63946",
+    midpoint = overall_rate,
+    limits   = c(0, 1),
+    name     = "P(Star)"
+  ) +
+  labs(
+    title    = "A.1: Career length × elite collaborators → probability of star emergence",
+    subtitle = sprintf("15×15 quantile bins; overall star rate = %.1f%%; red = high probability",
+                       100 * overall_rate),
+    x = "Num_Elite_Collaborators (quantile bin, low → high)",
+    y = "Career_Length (quantile bin, low → high)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "grey50", size = 10),
+    axis.text     = element_text(size = 8)
+  )
+```
+
+*The heatmap shows that star probability is highest in the top-right corner — long careers combined with many elite collaborators. Notably, elite exposure also boosts star probability even for shorter careers (bottom-right), supporting Liu et al.'s (2018) claim that access to stars accelerates performance independent of accumulated experience.*
+
+```{r appendix-brokerage, fig.width=9, fig.height=5}
+##Structural Holes (Burt Theory)
+ggplot(df, aes(x = Network_Constraint, fill = factor(Is_HighPerformer))) +
+  geom_density(alpha = 0.4, na.rm = TRUE) +
+  scale_fill_manual(values = c("0" = "#457B9D", "1" = "#E63946"),
+                    labels = c("Non-Star", "Star"),
+                    name = "Status") +
+  labs(
+    title    = "FIGURE-5 Q5: Brokerage Advantage split by star status",
+    subtitle = "Stars exhibit lower Network Constraint — consistent with Burt (2004) structural holes theory",
+    x = "Network Constraint", y = "Density"
+  ) +
+  theme_minimal()
+```
+
+*Stars cluster at lower constraint values, indicating they occupy broker positions spanning structural holes. Non-stars are concentrated at higher constraint, reflecting embeddedness within dense, redundant peer clusters.*
+
+
+## A.2: Additional regression plots and other important plots used 
+
+```{r appendix-mlr-residuals, fig.width=14, fig.height=10}
+# For a well-specified model, residuals should show no pattern
+# against fitted values, follow a normal distribution, and show constant variance.
+par(mfrow = c(2, 2))
+plot(model_mlr, which = 1, main = "(a) Residuals vs Fitted — Should be random")
+plot(model_mlr, which = 2, main = "(b) Normal Q-Q — Should follow diagonal")
+plot(model_mlr, which = 3, main = "(c) Scale-Location — Should be flat band")
+plot(model_mlr, which = 5, main = "(d) Residuals vs Leverage — Check influential points")
+par(mfrow = c(1, 1))
+```
+
+*MLR residuals are well-behaved for this type of data. The model is not misspecified in any serious way. The main issue is mild heteroscedasticity inherited from the citation distribution, not a fundamental modelling problem.*
+
+
+```{r appendix-regression}
+df_plot <- df %>%
+  select(Career_Length, Log_Impact) %>%
+  drop_na()
+
+df_plot <- df_plot %>%
+  mutate(
+    Career_Stage = case_when(
+      Career_Length < 5  ~ "Early",
+      Career_Length < 15 ~ "Mid",
+      TRUE               ~ "Late"
+    )
+  )
+
+ggplot(df_plot, aes(x = Log_Impact, fill = Career_Stage)) +
+  geom_density(alpha = 0.4)
+```
+
+
+## A.3 Additional Classification Plots 
+
+```{r appendix-classification}
+# Class separation plot 
+X_test_scaled <- scale(test_data[, classif_predictors],
+                       center = colMeans(train_data[, classif_predictors]),
+                       scale = apply(train_data[, classif_predictors], 2, sd))
+lda_proj <- as.matrix(X_test_scaled) %*% model_lda$scaling[, 1]
+
+proj_df <- tibble(
+  LD1 = as.numeric(lda_proj),
+  Status = factor(test_data$Is_HighPerformer, labels = c("Non-Elite", "Elite"))
+)
+
+ggplot(proj_df, aes(x = LD1, fill = Status)) +
+  geom_histogram(alpha = 0.6, bins = 40, position = "identity", colour = "white") +
+  scale_fill_manual(values = c("Non-Elite" = "#457B9D", "Elite" = "#E63946")) +
+  labs(title = "A.3 Fig 1: LDA Class Separation — Projection onto 1st Discriminant Axis",
+       subtitle = "Less overlap = easier classification = higher accuracy",
+       x = "LDA Discriminant Score", y = "Count") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+
+```{r appendix-pr-curves, fig.width=9, fig.height=6}
+library(ROCR)
+
+pred_lr_obj  <- prediction(pred_prob_lr, test_data$Is_HighPerformer)
+perf_pr_lr   <- performance(pred_lr_obj, "prec", "rec")
+
+pred_lda_obj <- prediction(pred_lda$posterior[, "1"], test_data$Is_HighPerformer)
+perf_pr_lda  <- performance(pred_lda_obj, "prec", "rec")
+
+compute_pr_auc <- function(perf) {
+  rec  <- perf@x.values[[1]]
+  prec <- perf@y.values[[1]]
+  valid <- !is.na(prec) & !is.na(rec)
+  rec <- rec[valid]; prec <- prec[valid]
+  ord <- order(rec)
+  sum(diff(rec[ord]) * (prec[ord][-1] + prec[ord][-length(prec[ord])]) / 2)
+}
+
+pr_auc_lr  <- compute_pr_auc(perf_pr_lr)
+pr_auc_lda <- compute_pr_auc(perf_pr_lda)
+baseline   <- mean(test_data$Is_HighPerformer == 1)
+
+plot(perf_pr_lr,  col = "#E63946", lwd = 2.5, ylim = c(0, 1),
+     main = "A.3 FIG:2: Precision-Recall Curves — Logistic vs LDA")
+plot(perf_pr_lda, col = "#457B9D", lwd = 2.5, add = TRUE)
+abline(h = baseline, lty = 3, col = "gray40", lwd = 1.5)
+legend("topright",
+       legend = c(sprintf("Logistic (PR-AUC = %.3f)", pr_auc_lr),
+                  sprintf("LDA      (PR-AUC = %.3f)", pr_auc_lda),
+                  sprintf("Random baseline  = %.3f",  baseline)),
+       col = c("#E63946", "#457B9D", "gray40"),
+       lwd = c(2.5, 2.5, 1.5), lty = c(1, 1, 3))
+mtext(sprintf("Class prevalence: %.1f%%  —  random PR-AUC = %.3f",
+              baseline * 100, baseline),
+      side = 1, line = 4, cex = 0.9, col = "gray30")
+```
+
+With an 87.7/12.3 class split, the ROC curve is misleadingly optimistic as the large number of true negatives keeps the false positive rate artificially low. The Precision-Recall curve is more informative, a random classifier scores PR-AUC equal to class prevalence ($\approx 0.121$), so both models represent strong discriminative power well above baseline. Although LDA achieves a marginally higher PR-AUC (0.907 vs 0.896), this reflects aggregate performance across all thresholds. At the chosen threshold of 0.2, logistic regression delivers substantially higher recall (95.0% vs 78.4%). Given the class imbalance, recall is the decisive metric as missing a true high performer is costlier than a false positive, confirming logistic regression as the preferred classifier.
